@@ -190,6 +190,22 @@ assert "Finished, with errors is classified as failure" grep -Fq "Manual update 
 assert "manual failure includes updater error details" grep -Fq "Error code: 100" "$FIXTURE/curl-args"
 cleanup_fixture
 
+# Upstream tag-filter helpers are not guaranteed to be nounset-safe.
+new_fixture
+cat >"$FIXTURE/updater/tag-filter.sh" <<'EOF'
+apply_only_exclude_tags() {
+  declare -A seen=()
+  local id=100
+  [[ -z "${seen[$id]}" ]]
+}
+EOF
+set +e
+bash "$APP" check >/dev/null 2>&1
+tag_filter_rc=$?
+set -e
+assert "upstream tag filter is isolated from companion nounset" test "$tag_filter_rc" -eq 0
+cleanup_fixture
+
 # Safe non-root SSH APT metadata refresh and update-state deduplication.
 new_fixture
 bash "$APP" check

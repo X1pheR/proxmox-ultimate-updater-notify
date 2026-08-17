@@ -109,6 +109,13 @@ resolve_update_selection() {
   if [[ -r "${UPDATER_DIR}/tag-filter.sh" ]]; then
     local ONLY=$ONLY_UPDATE_CHECK
     local EXCLUDED=$EXCLUDE_UPDATE_CHECK
+    local restore_nounset=no
+
+    # Upstream's selection helper is not guaranteed to be safe under `set -u`.
+    # Isolate only this borrowed helper from nounset, then restore our stricter
+    # shell contract before continuing with companion-owned logic.
+    [[ $- == *u* ]] && restore_nounset=yes
+    set +u
     # This is an upstream selection helper only. The updater's check implementation
     # itself is deliberately not executed because some non-APT code paths upgrade packages.
     # shellcheck disable=SC1091
@@ -118,6 +125,7 @@ resolve_update_selection() {
       ONLY_UPDATE_CHECK=$ONLY
       EXCLUDE_UPDATE_CHECK=$EXCLUDED
     fi
+    [[ "$restore_nounset" == yes ]] && set -u
   fi
 }
 
