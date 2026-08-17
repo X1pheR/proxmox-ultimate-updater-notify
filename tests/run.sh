@@ -100,7 +100,7 @@ cmd=${*: -1}
 case "$cmd" in
   true) exit 0 ;;
   *"command -v apt-get"*) exit 0 ;;
-  *"sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update"*)
+  *"sudo -n /usr/bin/apt-get update -y"*)
     [[ "${TEST_REFRESH_FAIL:-false}" == "true" ]] && exit 1
     exit 0
     ;;
@@ -193,7 +193,7 @@ cleanup_fixture
 # Safe non-root SSH APT metadata refresh and update-state deduplication.
 new_fixture
 bash "$APP" check
-assert "non-root SSH metadata refresh uses passwordless sudo" grep -Fq "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update" "$FIXTURE/ssh-log"
+assert "non-root SSH metadata refresh matches existing Ultimate Updater sudo rule" grep -Fq "sudo -n /usr/bin/apt-get update -y" "$FIXTURE/ssh-log"
 assert "first available-update state notifies" test "$(count_curl)" -eq 1
 bash "$APP" check
 assert "unchanged update state is deduplicated" test "$(count_curl)" -eq 1

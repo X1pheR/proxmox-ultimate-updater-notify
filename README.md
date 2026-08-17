@@ -42,7 +42,7 @@ The initial compatibility baseline is intentionally narrow:
 For non-root SSH VM targets, the SSH user must be able to run the metadata refresh non-interactively:
 
 ```text
-sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo -n /usr/bin/apt-get update -y
 ```
 
 The notifier fails closed for unsupported package-manager families, unavailable target access, stopped/paused guests selected for checking, or a non-root metadata refresh that would require an interactive sudo password.

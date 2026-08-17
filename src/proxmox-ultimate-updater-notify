@@ -239,14 +239,14 @@ check_vm_ssh() {
   if [[ "$user" == "root" ]]; then
     refresh_cmd='DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null'
   else
-    refresh_cmd='sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null'
+    refresh_cmd='sudo -n /usr/bin/apt-get update -y >/dev/null'
   fi
 
   if ! ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" "$refresh_cmd"; then
     if [[ "$user" == "root" ]]; then
       die "VM $id package metadata refresh failed"
     fi
-    die "VM $id package metadata refresh failed: non-root SSH user requires passwordless sudo for apt-get update"
+    die "VM $id package metadata refresh failed: non-root SSH user requires passwordless sudo for /usr/bin/apt-get update -y"
   fi
 
   apt_output=$(ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" 'LC_ALL=C apt-get -s upgrade')
