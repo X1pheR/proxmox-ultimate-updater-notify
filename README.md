@@ -1,6 +1,6 @@
 # Proxmox Ultimate Updater Notify
 
-`proxmox-ultimate-updater-notify` is a community-maintained notification companion for [BassT23/Proxmox Ultimate Updater](https://github.com/BassT23/Proxmox). It adds scheduled, deduplicated ntfy update checks and notifications for completed operator-triggered Ultimate Updater runs without adding unattended package upgrades.
+`proxmox-ultimate-updater-notify` is a community-maintained notification companion for [BassT23/Proxmox Ultimate Updater](https://github.com/BassT23/Proxmox). It adds scheduled, deduplicated ntfy update checks, notifications for completed operator-triggered Ultimate Updater runs, and upstream compatibility health checks without adding unattended package upgrades.
 
 This project is not affiliated with, endorsed by, or maintained by the Ultimate Updater project.
 
@@ -26,9 +26,12 @@ The notifier sends ntfy messages when:
 - an automatic check recovers;
 - an actual manual Ultimate Updater run succeeds;
 - an actual manual run fails;
-- Ultimate Updater prints `Finished, with errors.` even though its process exit status is zero.
+- Ultimate Updater prints `Finished, with errors.` even though its process exit status is zero;
+- the upstream compatibility health check fails or the failure changes;
+- a compatibility failure recovers;
+- Ultimate Updater interface files change and the new state passes compatibility validation.
 
-Unchanged automatic states are deduplicated. Multiple filesystem events from the same completed manual run are suppressed for a short window, while later identical manual runs still notify independently.
+Unchanged automatic and compatibility states are deduplicated. Multiple filesystem events from the same completed manual run are suppressed for a short window, while later identical manual runs still notify independently.
 
 ## Compatibility
 
@@ -46,6 +49,16 @@ sudo -n /usr/bin/apt-get update -y
 ```
 
 The notifier fails closed for unsupported package-manager families, unavailable target access, stopped/paused guests selected for checking, or a non-root metadata refresh that would require an interactive sudo password.
+
+Before every automatic update check, the notifier also validates the upstream integration boundary. A completed manual Ultimate Updater run revalidates the same boundary after its normal completion notification. The compatibility health check verifies that:
+
+- the upstream `update.sh` entrypoint still exposes a readable version marker;
+- `tag-filter.sh` is present and its `apply_only_exclude_tags` interface remains callable;
+- Ultimate Updater's configured `LOG_FILE` still matches the manual observer path;
+- no upstream automatic `update -check`/`check-updates.sh` root-cron entry has reappeared;
+- the companion's check timer and manual path watcher remain enabled and active.
+
+The guard does not silently rewrite an upstream change. An incompatible state produces a deduplicated ntfy warning and causes the automatic check to fail closed. When compatibility is restored, one recovery notification is sent. A changed upstream `update.sh` or `tag-filter.sh` that passes all checks produces one informational ntfy notification confirming that the new interface state was validated.
 
 ## Requirements
 
@@ -104,7 +117,13 @@ Use an `https://` ntfy topic URL whenever the publisher crosses an untrusted net
 
 ## Verify
 
-Run a check without installing packages:
+Run the compatibility health check directly:
+
+```bash
+sudo /usr/local/libexec/proxmox-ultimate-updater-notify health
+```
+
+Run an update check without installing packages. The compatibility health preflight runs first automatically:
 
 ```bash
 sudo /usr/local/libexec/proxmox-ultimate-updater-notify check

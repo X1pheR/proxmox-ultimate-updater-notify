@@ -41,12 +41,18 @@ CHECK_STOPPED_VM="true"
 CHECK_PAUSED_VM="true"
 ONLY_UPDATE_CHECK=""
 EXCLUDE_UPDATE_CHECK=""
+LOG_FILE="LOG_FILE_PLACEHOLDER"
 ERROR_LOG_FILE="ERROR_LOG_PLACEHOLDER"
 EOF
-  sed -i "s|ERROR_LOG_PLACEHOLDER|$FIXTURE/updater-error.log|" "$FIXTURE/updater/update.conf"
+  sed -i "s|LOG_FILE_PLACEHOLDER|$FIXTURE/ultimate-updater.log|; s|ERROR_LOG_PLACEHOLDER|$FIXTURE/updater-error.log|" "$FIXTURE/updater/update.conf"
   cat >"$FIXTURE/updater/tag-filter.sh" <<'EOF'
 apply_only_exclude_tags() { return 0; }
 EOF
+  cat >"$FIXTURE/updater/update.sh" <<'EOF'
+#!/usr/bin/env bash
+VERSION="5.0"
+EOF
+  : >"$FIXTURE/crontab"
   cat >"$FIXTURE/updater/VMs/101" <<'EOF'
 IP="192.0.2.101"
 USER="ronald"
@@ -67,6 +73,29 @@ if [[ "${TEST_CURL_FAIL:-false}" == "true" ]]; then
   exit 22
 fi
 exit 0
+EOF
+
+  cat >"$FIXTURE/bin/crontab" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-l" ]]; then
+  cat "$TEST_FIXTURE/crontab"
+  exit 0
+fi
+exit 1
+EOF
+
+  cat >"$FIXTURE/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}:${2:-}" in
+  is-active:proxmox-ultimate-updater-notify-manual.path)
+    [[ "${TEST_MANUAL_PATH_INACTIVE:-false}" == "true" ]] && exit 1
+    exit 0
+    ;;
+  is-enabled:proxmox-ultimate-updater-notify-check.timer|is-enabled:proxmox-ultimate-updater-notify-manual.path|is-active:proxmox-ultimate-updater-notify-check.timer)
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
 EOF
 
   cat >"$FIXTURE/bin/qm" <<'EOF'
@@ -118,11 +147,13 @@ EOF
   export PUUN_UPDATER_DIR="$FIXTURE/updater"
   export PUUN_UPDATER_CONFIG="$FIXTURE/updater/update.conf"
   export PUUN_UPDATER_LOG="$FIXTURE/ultimate-updater.log"
+  export PUUN_CRONTAB="$FIXTURE/bin/crontab"
+  export PUUN_SYSTEMCTL="$FIXTURE/bin/systemctl"
 }
 
 cleanup_fixture() {
   rm -rf "$FIXTURE"
-  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG
+  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_MANUAL_PATH_INACTIVE PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL
 }
 
 count_curl() {
@@ -143,6 +174,151 @@ if grep -nE '\b(qm|pct)[[:space:]]+(start|stop|shutdown|resume|suspend|reboot)\b
 else
   pass "automatic checker contains no guest power-state mutation"
 fi
+
+# Compatibility health: a reintroduced upstream check cron is unsafe and must alert.
+new_fixture
+printf '0 7 * * * /etc/ultimate-updater/update.sh -check >/dev/null 2>&1\n' >"$FIXTURE/crontab"
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_cron_rc=$?
+set -e
+assert "reintroduced upstream check cron fails compatibility health" test "$health_cron_rc" -ne 0
+assert "compatibility health failure sends a dedicated ntfy warning" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
+cleanup_fixture
+
+# Compatibility health must fail closed if root-crontab inspection is unavailable.
+new_fixture
+export PUUN_CRONTAB="$FIXTURE/bin/missing-crontab"
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_crontab_missing_rc=$?
+set -e
+assert "missing crontab inspector fails compatibility health" test "$health_crontab_missing_rc" -ne 0
+assert "missing crontab inspector is reported through ntfy" grep -Fq "required command not found" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Failed ntfy delivery must not poison compatibility-health dedupe state.
+new_fixture
+printf '0 7 * * * /etc/ultimate-updater/update.sh -check >/dev/null 2>&1\n' >"$FIXTURE/crontab"
+export TEST_CURL_FAIL=true
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_notify_fail_rc=$?
+set -e
+assert "ntfy delivery failure keeps compatibility health non-zero" test "$health_notify_fail_rc" -ne 0
+assert "failed compatibility ntfy delivery does not persist dedupe state" test ! -e "$FIXTURE/state/health-status"
+unset TEST_CURL_FAIL
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_retry_rc=$?
+bash "$APP" health >/dev/null 2>&1
+health_repeat_rc=$?
+set -e
+assert "compatibility failure retries after ntfy recovers" test "$health_retry_rc" -ne 0
+assert "repeated compatibility failure remains non-zero" test "$health_repeat_rc" -ne 0
+assert "delivered identical compatibility failure is then deduplicated" test "$(count_curl)" -eq 2
+cleanup_fixture
+
+# Automatic checks must run compatibility health first and fail closed on incompatibility.
+new_fixture
+printf '0 7 * * * /etc/ultimate-updater/update.sh -check >/dev/null 2>&1\n' >"$FIXTURE/crontab"
+set +e
+bash "$APP" check >/dev/null 2>&1
+check_health_rc=$?
+set -e
+assert "automatic check fails closed when compatibility health fails" test "$check_health_rc" -ne 0
+assert "failed compatibility preflight prevents update-state collection" test ! -e "$FIXTURE/state/check-status"
+assert "automatic check reports compatibility failure through ntfy" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
+cleanup_fixture
+
+# Compatibility health: upstream manual-log path must remain aligned with the observer.
+new_fixture
+sed -i "s|^LOG_FILE=.*|LOG_FILE=\"$FIXTURE/moved-upstream.log\"|" "$FIXTURE/updater/update.conf"
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_log_rc=$?
+set -e
+assert "changed upstream manual-log path fails compatibility health" test "$health_log_rc" -ne 0
+assert "changed upstream manual-log path is reported through ntfy" grep -Fq "LOG_FILE" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Compatibility health: companion scheduling/watch units must remain active.
+new_fixture
+export TEST_MANUAL_PATH_INACTIVE=true
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_path_rc=$?
+set -e
+assert "inactive manual path watcher fails compatibility health" test "$health_path_rc" -ne 0
+assert "inactive manual path watcher is reported through ntfy" grep -Fq "manual.path" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Compatibility health: a healthy upstream change is reported once after validation.
+new_fixture
+bash "$APP" health
+assert "initial healthy compatibility baseline is silent" test "$(count_curl)" -eq 0
+cat >"$FIXTURE/updater/update.sh" <<'EOF'
+#!/usr/bin/env bash
+VERSION="5.1"
+EOF
+bash "$APP" health
+assert "validated upstream change sends one ntfy notification" test "$(count_curl)" -eq 1
+assert "validated upstream change reports the version transition" grep -Fq "5.0 -> 5.1" "$FIXTURE/curl-args"
+bash "$APP" health
+assert "unchanged validated upstream state is deduplicated" test "$(count_curl)" -eq 1
+cleanup_fixture
+
+# Compatibility health: a previously reported incompatibility sends one recovery notification.
+new_fixture
+bash "$APP" health
+cat >"$FIXTURE/updater/tag-filter.sh" <<'EOF'
+# Broken helper interface.
+EOF
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_failure_rc=$?
+set -e
+assert "compatibility failure remains non-zero before recovery" test "$health_failure_rc" -ne 0
+cat >"$FIXTURE/updater/tag-filter.sh" <<'EOF'
+apply_only_exclude_tags() { return 0; }
+EOF
+bash "$APP" health
+assert "compatibility recovery sends a second ntfy notification" test "$(count_curl)" -eq 2
+assert "compatibility recovery uses a dedicated recovery title" grep -Fq "Compatibility check recovered" "$FIXTURE/curl-stdin"
+bash "$APP" health
+assert "healthy compatibility recovery state is deduplicated" test "$(count_curl)" -eq 2
+cleanup_fixture
+
+# Compatibility health: upstream selection helper must remain callable.
+new_fixture
+cat >"$FIXTURE/updater/tag-filter.sh" <<'EOF'
+# Simulate an incompatible upstream helper interface.
+EOF
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_helper_rc=$?
+set -e
+assert "missing upstream tag helper fails compatibility health" test "$health_helper_rc" -ne 0
+assert "tag helper incompatibility is reported through ntfy" grep -Fq "tag-filter.sh" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Completed manual runs must also revalidate compatibility after the manual notification.
+new_fixture
+bash "$APP" health
+cat >"$FIXTURE/ultimate-updater.log" <<'EOF'
+Updating Host : 192.0.2.1 | (pve)
+--- PVE UPDATE ---
+Finished, all updates done.
+EOF
+printf '0 7 * * * /etc/ultimate-updater/update.sh -check >/dev/null 2>&1\n' >"$FIXTURE/crontab"
+set +e
+bash "$APP" observe-manual >/dev/null 2>&1
+manual_health_rc=$?
+set -e
+assert "manual completion still sends its normal notification before health alert" grep -Fq "Manual update succeeded" "$FIXTURE/curl-stdin"
+assert "manual completion revalidates compatibility and reports failure" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
+assert "manual observer is non-zero when post-run compatibility fails" test "$manual_health_rc" -ne 0
+cleanup_fixture
 
 # Manual observation: version/help-like log must not notify.
 new_fixture
@@ -275,8 +451,14 @@ CONFIG_PATH="$INSTALL_FIXTURE/root/etc/proxmox-ultimate-updater-notify/config"
 printf '\nLOCAL_OPERATOR_VALUE="preserve-me"\n' >>"$CONFIG_PATH"
 PUUN_ROOT_PREFIX="$INSTALL_FIXTURE/root" PUUN_CRONTAB="$INSTALL_FIXTURE/bin/crontab" bash "$INSTALLER" install
 assert "reinstall preserves operator config" grep -Fq 'LOCAL_OPERATOR_VALUE="preserve-me"' "$CONFIG_PATH"
+STATE_PATH="$INSTALL_FIXTURE/root/var/lib/proxmox-ultimate-updater-notify"
+printf 'failure\n' >"$STATE_PATH/health-status"
+printf 'hash\n' >"$STATE_PATH/health-hash"
+printf 'fingerprint\n' >"$STATE_PATH/upstream-fingerprint"
+printf '5.0\n' >"$STATE_PATH/upstream-version"
 PUUN_ROOT_PREFIX="$INSTALL_FIXTURE/root" PUUN_CRONTAB="$INSTALL_FIXTURE/bin/crontab" bash "$INSTALLER" uninstall
 assert "uninstall restores original update-check cron" grep -Fq "/usr/local/sbin/update -check" "$CRON_STORE"
+assert "uninstall removes compatibility health state" test ! -e "$STATE_PATH/health-status" -a ! -e "$STATE_PATH/health-hash" -a ! -e "$STATE_PATH/upstream-fingerprint" -a ! -e "$STATE_PATH/upstream-version"
 assert "uninstall preserves operator config and token directory" grep -Fq 'LOCAL_OPERATOR_VALUE="preserve-me"' "$CONFIG_PATH"
 rm -rf "$INSTALL_FIXTURE"
 unset TEST_CRON_STORE

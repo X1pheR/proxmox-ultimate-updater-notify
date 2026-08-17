@@ -153,6 +153,10 @@ uninstall_product() {
     "$CRON_BACKUP" \
     "$STATE_DIR/check-status" \
     "$STATE_DIR/check-hash" \
+    "$STATE_DIR/health-status" \
+    "$STATE_DIR/health-hash" \
+    "$STATE_DIR/upstream-fingerprint" \
+    "$STATE_DIR/upstream-version" \
     "$STATE_DIR/manual-signature" \
     "$STATE_DIR/manual-time"
   rmdir "$STATE_DIR" 2>/dev/null || true

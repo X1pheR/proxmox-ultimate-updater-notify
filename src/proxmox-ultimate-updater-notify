@@ -7,6 +7,9 @@ STATE_DIR="${PUUN_STATE_DIR:-/var/lib/proxmox-ultimate-updater-notify}"
 UPDATER_DIR="${PUUN_UPDATER_DIR:-/etc/ultimate-updater}"
 UPDATER_CONFIG="${PUUN_UPDATER_CONFIG:-${UPDATER_DIR}/update.conf}"
 UPDATER_LOG="${PUUN_UPDATER_LOG:-/var/log/ultimate-updater.log}"
+UPDATER_ENTRYPOINT="${PUUN_UPDATER_ENTRYPOINT:-${UPDATER_DIR}/update.sh}"
+SYSTEMCTL="${PUUN_SYSTEMCTL:-systemctl}"
+CRONTAB="${PUUN_CRONTAB:-crontab}"
 MANUAL_DEDUPE_SECONDS="${PUUN_MANUAL_DEDUPE_SECONDS:-90}"
 
 log() {
@@ -90,6 +93,164 @@ sanitize_text() {
 
 hash_text() {
   sha256sum | awk '{print $1}'
+}
+
+is_updater_check_cron() {
+  local line=$1
+  [[ "$line" =~ (^|[[:space:]])(/usr/local/sbin/)?update[[:space:]]+-check([[:space:]]|$) ]] ||
+    [[ "$line" =~ (^|[[:space:]])/etc/ultimate-updater/update\.sh[[:space:]]+-check([[:space:]]|$) ]] ||
+    [[ "$line" =~ (^|[[:space:]])/etc/ultimate-updater/check-updates\.sh([[:space:]]|$) ]]
+}
+
+read_updater_version() {
+  awk -F'"' '/^VERSION="/ { print $2; exit }' "$UPDATER_ENTRYPOINT"
+}
+
+upstream_fingerprint() {
+  {
+    sha256sum "$UPDATER_ENTRYPOINT" | awk '{print $1}'
+    sha256sum "${UPDATER_DIR}/tag-filter.sh" | awk '{print $1}'
+  } | hash_text
+}
+
+validate_companion_units() {
+  local unit
+  for unit in "$APP_NAME-check.timer" "$APP_NAME-manual.path"; do
+    if ! "$SYSTEMCTL" is-enabled "$unit" >/dev/null 2>&1; then
+      die "companion systemd unit is not enabled: $unit"
+    fi
+    if ! "$SYSTEMCTL" is-active "$unit" >/dev/null 2>&1; then
+      die "companion systemd unit is not active: $unit"
+    fi
+  done
+}
+
+validate_tag_helper() (
+  local ONLY
+  local EXCLUDED
+
+  [[ -r "$UPDATER_CONFIG" ]] || die "Ultimate Updater configuration is not readable: $UPDATER_CONFIG"
+  [[ -r "${UPDATER_DIR}/tag-filter.sh" ]] || die "Ultimate Updater tag-filter.sh is not readable"
+  ONLY=$(read_updater_value ONLY_UPDATE_CHECK || true)
+  EXCLUDED=$(read_updater_value EXCLUDE_UPDATE_CHECK || true)
+
+  # Upstream's helper is not guaranteed to be nounset-safe. Keep the relaxed
+  # shell option inside this isolated compatibility probe only.
+  set +u
+  # shellcheck disable=SC1091
+  . "${UPDATER_DIR}/tag-filter.sh"
+  declare -F apply_only_exclude_tags >/dev/null 2>&1 || die "Ultimate Updater tag-filter.sh no longer exposes apply_only_exclude_tags"
+  apply_only_exclude_tags ONLY EXCLUDED || die "Ultimate Updater tag-filter.sh compatibility probe failed"
+)
+
+compatibility_probe() {
+  local line
+  local version
+  local fingerprint
+  local configured_log
+
+  [[ -r "$UPDATER_ENTRYPOINT" ]] || die "Ultimate Updater entrypoint is not readable: $UPDATER_ENTRYPOINT"
+  require_command sha256sum
+  require_command "$CRONTAB"
+  version=$(read_updater_version)
+  [[ -n "$version" ]] || die "Ultimate Updater version marker is missing or incompatible"
+  configured_log=$(read_updater_value LOG_FILE || true)
+  [[ -n "$configured_log" ]] || die "Ultimate Updater LOG_FILE is missing from $UPDATER_CONFIG"
+  [[ "$configured_log" == "$UPDATER_LOG" ]] || die "Ultimate Updater LOG_FILE changed; expected observer path $UPDATER_LOG"
+  validate_tag_helper || return 1
+  validate_companion_units || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if is_updater_check_cron "$line"; then
+      die "Ultimate Updater automatic check cron is present; companion scheduling must remain the only automatic check path"
+    fi
+  done < <("$CRONTAB" -l 2>/dev/null || true)
+
+  fingerprint=$(upstream_fingerprint)
+  printf '%s|%s\n' "$version" "$fingerprint"
+}
+
+process_health_failure() {
+  local error_text=$1
+  local previous_status
+  local previous_hash
+  local current_hash
+
+  ensure_state_dir
+  previous_status=$(state_read "${STATE_DIR}/health-status")
+  previous_hash=$(state_read "${STATE_DIR}/health-hash")
+  error_text=$(printf '%s\n' "$error_text" | sanitize_text | tail -20)
+  [[ -n "$error_text" ]] || error_text="Unknown compatibility-health failure"
+  current_hash=$(printf '%s\n' "$error_text" | hash_text)
+
+  if [[ "$previous_status" != "failure" || "$previous_hash" != "$current_hash" ]]; then
+    if ! send_ntfy "Compatibility check failed" "warning" "$error_text"; then
+      log "failed to send ntfy compatibility failure notification"
+      return 1
+    fi
+  fi
+  atomic_write "${STATE_DIR}/health-status" "failure"
+  atomic_write "${STATE_DIR}/health-hash" "$current_hash"
+}
+
+process_health_success() {
+  local version=$1
+  local fingerprint=$2
+  local previous_status
+  local previous_fingerprint
+  local previous_version
+
+  ensure_state_dir
+  previous_status=$(state_read "${STATE_DIR}/health-status")
+  previous_fingerprint=$(state_read "${STATE_DIR}/upstream-fingerprint")
+  previous_version=$(state_read "${STATE_DIR}/upstream-version")
+
+  if [[ "$previous_status" == "failure" ]]; then
+    if ! send_ntfy "Compatibility check recovered" "white_check_mark" "Ultimate Updater compatibility checks are succeeding again. Current version: $version"; then
+      log "failed to send ntfy compatibility recovery notification"
+      return 1
+    fi
+  elif [[ -n "$previous_fingerprint" && "$previous_fingerprint" != "$fingerprint" ]]; then
+    if ! send_ntfy "Ultimate Updater change verified" "white_check_mark" "Compatibility checks passed after an Ultimate Updater interface change. Version: ${previous_version:-unknown} -> $version"; then
+      log "failed to send ntfy verified upstream-change notification"
+      return 1
+    fi
+  fi
+
+  atomic_write "${STATE_DIR}/health-status" "healthy"
+  atomic_write "${STATE_DIR}/health-hash" ""
+  atomic_write "${STATE_DIR}/upstream-fingerprint" "$fingerprint"
+  atomic_write "${STATE_DIR}/upstream-version" "$version"
+}
+
+run_health() {
+  local output_file
+  local error_file
+  local probe_output
+  local version
+  local fingerprint
+  local rc
+
+  output_file=$(mktemp)
+  error_file=$(mktemp)
+  set +e
+  ( compatibility_probe ) >"$output_file" 2>"$error_file"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    if ! process_health_failure "$(cat "$error_file")"; then
+      rm -f "$output_file" "$error_file"
+      return 1
+    fi
+    rm -f "$output_file" "$error_file"
+    return "$rc"
+  fi
+
+  probe_output=$(cat "$output_file")
+  rm -f "$output_file" "$error_file"
+  version=${probe_output%%|*}
+  fingerprint=${probe_output#*|}
+  process_health_success "$version" "$fingerprint"
 }
 
 is_word_in_list() {
@@ -441,6 +602,10 @@ run_check() {
   local normalized
   local rc
 
+  if ! run_health; then
+    return 1
+  fi
+
   output_file=$(mktemp)
   error_file=$(mktemp)
 
@@ -538,13 +703,19 @@ observe_manual() {
   send_ntfy "$title" "$tags" "$details"
   atomic_write "${STATE_DIR}/manual-signature" "$signature"
   atomic_write "${STATE_DIR}/manual-time" "$now"
+
+  # Revalidate upstream integration only after a terminal manual-run marker is
+  # observed. This avoids health probes on every intermediate log write while
+  # still catching self-update/interface changes immediately after a real run.
+  run_health
 }
 
 usage() {
   cat <<'EOF'
-Usage: proxmox-ultimate-updater-notify <check|observe-manual>
+Usage: proxmox-ultimate-updater-notify <check|health|observe-manual>
 
   check           Refresh APT metadata and report available updates without installing packages.
+  health          Validate Ultimate Updater compatibility and companion scheduling health.
   observe-manual  Inspect the Ultimate Updater log and notify on completed operator-triggered runs.
 EOF
 }
@@ -553,6 +724,9 @@ main() {
   case "${1:-}" in
     check)
       run_check
+      ;;
+    health)
+      run_health
       ;;
     observe-manual)
       observe_manual
