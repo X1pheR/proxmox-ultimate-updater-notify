@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Bash syntax
+        run: bash -n install.sh src/proxmox-ultimate-updater-notify tests/run.sh
+
+      - name: ShellCheck
+        run: shellcheck install.sh src/proxmox-ultimate-updater-notify tests/run.sh
+
+      - name: Behavior tests
+        run: bash tests/run.sh
+
+      - name: Verify systemd units
+        run: |
+          sudo install -m 0755 src/proxmox-ultimate-updater-notify /usr/local/libexec/proxmox-ultimate-updater-notify
+          systemd-analyze verify systemd/*.service systemd/*.timer systemd/*.path

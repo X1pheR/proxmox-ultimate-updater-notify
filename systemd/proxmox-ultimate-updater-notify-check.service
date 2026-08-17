@@ -1,0 +1,8 @@
+[Unit]
+Description=Check Proxmox Ultimate Updater targets and notify via ntfy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/proxmox-ultimate-updater-notify check

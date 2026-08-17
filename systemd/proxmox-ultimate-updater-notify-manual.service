@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify on completed manual Proxmox Ultimate Updater runs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/proxmox-ultimate-updater-notify observe-manual

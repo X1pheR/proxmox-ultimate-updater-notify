@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the Ultimate Updater log for completed manual runs
+
+[Path]
+PathChanged=/var/log/ultimate-updater.log
+Unit=proxmox-ultimate-updater-notify-manual.service
+
+[Install]
+WantedBy=multi-user.target

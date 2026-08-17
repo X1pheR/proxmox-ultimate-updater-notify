@@ -1,0 +1,9 @@
+# ntfy topic URL. Keep deployment-specific values outside the public product repository.
+# Prefer HTTPS whenever the publisher crosses an untrusted network boundary.
+NTFY_URL="https://ntfy.example.com/ultimate-updater"
+
+# Root-readable file containing only the ntfy access token. The notifier sends
+# it using native ntfy Bearer authentication and never places it in curl argv.
+NTFY_TOKEN_FILE="/etc/proxmox-ultimate-updater-notify/ntfy-token"
+
+NTFY_TITLE_PREFIX="Ultimate Updater"

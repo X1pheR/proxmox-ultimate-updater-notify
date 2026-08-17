@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="proxmox-ultimate-updater-notify"
+CONFIG_FILE="${PUUN_CONFIG_FILE:-/etc/proxmox-ultimate-updater-notify/config}"
+STATE_DIR="${PUUN_STATE_DIR:-/var/lib/proxmox-ultimate-updater-notify}"
+UPDATER_DIR="${PUUN_UPDATER_DIR:-/etc/ultimate-updater}"
+UPDATER_CONFIG="${PUUN_UPDATER_CONFIG:-${UPDATER_DIR}/update.conf}"
+UPDATER_LOG="${PUUN_UPDATER_LOG:-/var/log/ultimate-updater.log}"
+MANUAL_DEDUPE_SECONDS="${PUUN_MANUAL_DEDUPE_SECONDS:-90}"
+
+log() {
+  printf '%s: %s\n' "$APP_NAME" "$*" >&2
+}
+
+die() {
+  log "$*"
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+read_updater_value() {
+  local key=$1
+  awk -F'"' -v key="$key" '$0 ~ "^" key "=" { print $2; exit }' "$UPDATER_CONFIG"
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || die "configuration file is not readable: $CONFIG_FILE"
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+
+  : "${NTFY_URL:?NTFY_URL must be configured}"
+  : "${NTFY_TOKEN_FILE:?NTFY_TOKEN_FILE must be configured}"
+  NTFY_TITLE_PREFIX="${NTFY_TITLE_PREFIX:-Ultimate Updater}"
+
+  [[ -r "$NTFY_TOKEN_FILE" ]] || die "ntfy token file is not readable: $NTFY_TOKEN_FILE"
+  require_command curl
+}
+
+ensure_state_dir() {
+  install -d -m 0700 "$STATE_DIR"
+}
+
+atomic_write() {
+  local path=$1
+  local value=$2
+  local tmp
+  tmp=$(mktemp "${STATE_DIR}/.tmp.XXXXXX")
+  printf '%s\n' "$value" >"$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+state_read() {
+  local path=$1
+  [[ -r "$path" ]] || return 0
+  cat "$path"
+}
+
+send_ntfy() {
+  local title=$1
+  local tags=$2
+  local message=$3
+  local token
+
+  load_config
+  token=$(<"$NTFY_TOKEN_FILE")
+  [[ -n "$token" ]] || die "ntfy token file is empty"
+
+  # Keep the bearer token out of argv. curl reads all headers from stdin.
+  {
+    printf 'Authorization: Bearer %s\n' "$token"
+    printf 'Title: %s\n' "${NTFY_TITLE_PREFIX}: ${title}"
+    [[ -n "$tags" ]] && printf 'Tags: %s\n' "$tags"
+  } | curl \
+    --fail \
+    --silent \
+    --show-error \
+    --header @- \
+    --data-binary "$message" \
+    "$NTFY_URL" >/dev/null
+}
+
+sanitize_text() {
+  sed -r 's/\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGK]//g'
+}
+
+hash_text() {
+  sha256sum | awk '{print $1}'
+}
+
+is_word_in_list() {
+  local needle=$1
+  local item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+resolve_update_selection() {
+  ONLY_UPDATE_CHECK=$(read_updater_value ONLY_UPDATE_CHECK || true)
+  EXCLUDE_UPDATE_CHECK=$(read_updater_value EXCLUDE_UPDATE_CHECK || true)
+
+  if [[ -r "${UPDATER_DIR}/tag-filter.sh" ]]; then
+    local ONLY=$ONLY_UPDATE_CHECK
+    local EXCLUDED=$EXCLUDE_UPDATE_CHECK
+    # This is an upstream selection helper only. The updater's check implementation
+    # itself is deliberately not executed because some non-APT code paths upgrade packages.
+    # shellcheck disable=SC1091
+    . "${UPDATER_DIR}/tag-filter.sh"
+    if declare -F apply_only_exclude_tags >/dev/null 2>&1; then
+      apply_only_exclude_tags ONLY EXCLUDED
+      ONLY_UPDATE_CHECK=$ONLY
+      EXCLUDE_UPDATE_CHECK=$EXCLUDED
+    fi
+  fi
+}
+
+id_is_selected() {
+  local id=$1
+  local -a only_ids=()
+  local -a excluded_ids=()
+
+  # shellcheck disable=SC2206
+  only_ids=( $ONLY_UPDATE_CHECK )
+  # shellcheck disable=SC2206
+  excluded_ids=( $EXCLUDE_UPDATE_CHECK )
+
+  if ((${#only_ids[@]} > 0)); then
+    is_word_in_list "$id" "${only_ids[@]}"
+    return
+  fi
+  ! is_word_in_list "$id" "${excluded_ids[@]}"
+}
+
+extract_apt_packages() {
+  sed -n '/^Inst /p'
+}
+
+append_apt_result() {
+  local type=$1
+  local id=$2
+  local name=$3
+  local reboot=$4
+  local apt_output=$5
+  local packages
+  local count
+  local security_count
+
+  packages=$(printf '%s\n' "$apt_output" | extract_apt_packages)
+  count=$(printf '%s\n' "$packages" | sed '/^$/d' | wc -l | tr -d ' ')
+  security_count=$(printf '%s\n' "$packages" | grep -ciE '(security|updates-security)' || true)
+
+  if [[ "$count" -gt 0 || "$reboot" == "yes" ]]; then
+    printf 'target|%s|%s|%s|packages=%s|security=%s|reboot=%s\n' \
+      "$type" "$id" "$name" "$count" "$security_count" "$reboot"
+    if [[ -n "$packages" ]]; then
+      printf '%s\n' "$packages" | sed 's/^/package|/'
+    fi
+  fi
+}
+
+check_host() {
+  local name
+  local apt_output
+  local reboot=no
+
+  require_command apt-get
+  name=$(hostname -s)
+  DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null
+  apt_output=$(LC_ALL=C apt-get -s upgrade)
+  [[ -f /var/run/reboot-required.pkgs ]] && reboot=yes
+  append_apt_result host host "$name" "$reboot" "$apt_output"
+}
+
+check_lxc() {
+  local id=$1
+  local status
+  local ostype
+  local name
+  local apt_output
+  local reboot=no
+
+  status=$(pct status "$id" | awk '{print $2}')
+  if [[ "$status" != "running" ]]; then
+    die "LXC $id is $status; automatic checks never start or stop guests"
+  fi
+
+  ostype=$(pct config "$id" | awk '/^ostype:/ {print $2; exit}')
+  case "$ostype" in
+    debian|ubuntu|devuan) ;;
+    *) die "LXC $id uses unsupported automatic-check OS family: ${ostype:-unknown}" ;;
+  esac
+
+  name=$(pct exec "$id" -- hostname 2>/dev/null || printf 'lxc-%s' "$id")
+  apt_output=$(pct exec "$id" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
+  if pct exec "$id" -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
+    reboot=yes
+  fi
+  append_apt_result lxc "$id" "$name" "$reboot" "$apt_output"
+}
+
+ssh_vm_value() {
+  local file=$1
+  local key=$2
+  awk -F'"' -v key="$key" '$0 ~ "^" key "=" { print $2; exit }' "$file"
+}
+
+check_vm_ssh() {
+  local id=$1
+  local file="${UPDATER_DIR}/VMs/${id}"
+  local ip
+  local user
+  local port
+  local name
+  local apt_output
+  local reboot=no
+  local refresh_cmd
+
+  ip=$(ssh_vm_value "$file" IP)
+  user=$(ssh_vm_value "$file" USER)
+  port=$(ssh_vm_value "$file" SSH_VM_PORT)
+  user=${user:-root}
+  port=${port:-22}
+  [[ -n "$ip" ]] || die "VM $id SSH configuration has no IP"
+
+  if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" true >/dev/null 2>&1; then
+    die "VM $id SSH connection failed"
+  fi
+  if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'command -v apt-get >/dev/null 2>&1'; then
+    die "VM $id uses an unsupported automatic-check package manager"
+  fi
+
+  if [[ "$user" == "root" ]]; then
+    refresh_cmd='DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null'
+  else
+    refresh_cmd='sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null'
+  fi
+
+  if ! ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" "$refresh_cmd"; then
+    if [[ "$user" == "root" ]]; then
+      die "VM $id package metadata refresh failed"
+    fi
+    die "VM $id package metadata refresh failed: non-root SSH user requires passwordless sudo for apt-get update"
+  fi
+
+  apt_output=$(ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" 'LC_ALL=C apt-get -s upgrade')
+  if ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'test -f /var/run/reboot-required.pkgs'; then
+    reboot=yes
+  fi
+  name=$(qm config "$id" | awk '/^name:/ {print $2; exit}')
+  name=${name:-vm-$id}
+  append_apt_result vm "$id" "$name" "$reboot" "$apt_output"
+}
+
+qemu_guest_stdout() {
+  python3 -c 'import json,sys; print(json.load(sys.stdin).get("out-data", ""), end="")'
+}
+
+check_vm_qemu() {
+  local id=$1
+  local status
+  local name
+  local probe
+  local result
+  local apt_output
+  local reboot=no
+
+  status=$(qm status "$id" | awk '{print $2}')
+  if [[ "$status" != "running" ]]; then
+    die "VM $id is $status; automatic checks never start, resume, stop, suspend, or reboot guests"
+  fi
+
+  probe=$(qm guest exec "$id" --timeout 10 -- sh -c 'command -v apt-get >/dev/null 2>&1 && printf apt' 2>/dev/null | qemu_guest_stdout || true)
+  [[ "$probe" == "apt" ]] || die "VM $id uses an unsupported automatic-check package manager or QEMU guest agent is unavailable"
+
+  result=$(qm guest exec "$id" --timeout 0 -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
+  apt_output=$(printf '%s' "$result" | qemu_guest_stdout)
+  if qm guest exec "$id" --timeout 10 -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
+    reboot=yes
+  fi
+  name=$(qm config "$id" | awk '/^name:/ {print $2; exit}')
+  name=${name:-vm-$id}
+  append_apt_result vm "$id" "$name" "$reboot" "$apt_output"
+}
+
+check_vm() {
+  local id=$1
+  if [[ -f "${UPDATER_DIR}/VMs/${id}" ]]; then
+    check_vm_ssh "$id"
+  else
+    check_vm_qemu "$id"
+  fi
+}
+
+collect_updates() {
+  local with_host
+  local with_lxc
+  local with_vm
+  local check_running_lxc
+  local check_stopped_lxc
+  local check_running_vm
+  local check_stopped_vm
+  local check_paused_vm
+  local id
+  local status
+
+  [[ -r "$UPDATER_CONFIG" ]] || die "Ultimate Updater configuration is not readable: $UPDATER_CONFIG"
+  require_command sha256sum
+  require_command pct
+  require_command qm
+  require_command python3
+  resolve_update_selection
+
+  with_host=$(read_updater_value CHECK_WITH_HOST || true)
+  with_lxc=$(read_updater_value CHECK_WITH_LXC || true)
+  with_vm=$(read_updater_value CHECK_WITH_VM || true)
+  check_running_lxc=$(read_updater_value CHECK_RUNNING_CONTAINER || true)
+  check_stopped_lxc=$(read_updater_value CHECK_STOPPED_CONTAINER || true)
+  check_running_vm=$(read_updater_value CHECK_RUNNING_VM || true)
+  check_stopped_vm=$(read_updater_value CHECK_STOPPED_VM || true)
+  check_paused_vm=$(read_updater_value CHECK_PAUSED_VM || true)
+
+  if [[ "$with_host" == "true" ]]; then
+    check_host
+  fi
+
+  if [[ "$with_lxc" == "true" ]]; then
+    while read -r id _; do
+      [[ -n "$id" ]] || continue
+      id_is_selected "$id" || continue
+      status=$(pct status "$id" | awk '{print $2}')
+      if [[ "$status" == "running" && "$check_running_lxc" == "true" ]]; then
+        check_lxc "$id"
+      elif [[ "$status" != "running" && "$check_stopped_lxc" == "true" ]]; then
+        die "LXC $id is $status but is configured for update checks; automatic checks never start or stop guests"
+      fi
+    done < <(pct list | awk 'NR > 1 {print $1, $2}')
+  fi
+
+  if [[ "$with_vm" == "true" ]]; then
+    while read -r id _; do
+      [[ -n "$id" ]] || continue
+      id_is_selected "$id" || continue
+      status=$(qm status "$id" | awk '{print $2}')
+      if [[ "$status" == "running" && "$check_running_vm" == "true" ]]; then
+        check_vm "$id"
+      elif [[ "$status" == "paused" && "$check_paused_vm" == "true" ]]; then
+        die "VM $id is paused but is configured for update checks; automatic checks never resume or suspend guests"
+      elif [[ "$status" != "running" && "$status" != "paused" && "$check_stopped_vm" == "true" ]]; then
+        die "VM $id is $status but is configured for update checks; automatic checks never start or stop guests"
+      fi
+    done < <(qm list | awk 'NR > 1 {print $1, $3}')
+  fi
+}
+
+format_update_message() {
+  local normalized=$1
+  local target_count
+  local package_count
+  local summary
+
+  target_count=$(printf '%s\n' "$normalized" | grep -c '^target|' || true)
+  package_count=$(printf '%s\n' "$normalized" | grep -c '^package|' || true)
+  summary=$(printf '%s\n' "$normalized" | sed -n '1,40p' | sed 's/^target|/Target: /; s/^package|/  /')
+  printf '%s target(s), %s package update(s) or reboot state changes.\n\n%s' "$target_count" "$package_count" "$summary"
+}
+
+process_check_success() {
+  local normalized=$1
+  local previous_status
+  local previous_hash
+  local current_hash
+
+  ensure_state_dir
+  previous_status=$(state_read "${STATE_DIR}/check-status")
+  previous_hash=$(state_read "${STATE_DIR}/check-hash")
+
+  if [[ -n "$normalized" ]]; then
+    current_hash=$(printf '%s\n' "$normalized" | hash_text)
+    if [[ "$previous_status" == "failure" ]]; then
+      send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again."
+    fi
+    if [[ "$previous_status" != "updates" ]]; then
+      send_ntfy "Updates available" "package" "$(format_update_message "$normalized")"
+    elif [[ "$previous_hash" != "$current_hash" ]]; then
+      send_ntfy "Available updates changed" "package" "$(format_update_message "$normalized")"
+    fi
+    atomic_write "${STATE_DIR}/check-status" "updates"
+    atomic_write "${STATE_DIR}/check-hash" "$current_hash"
+  else
+    if [[ "$previous_status" == "failure" ]]; then
+      send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again. No updates or reboot-required states are currently reported."
+    elif [[ "$previous_status" == "updates" ]]; then
+      send_ntfy "Updates cleared" "white_check_mark" "Previously reported package updates or reboot-required states are no longer present."
+    fi
+    atomic_write "${STATE_DIR}/check-status" "clear"
+    atomic_write "${STATE_DIR}/check-hash" ""
+  fi
+}
+
+process_check_failure() {
+  local error_text=$1
+  local previous_status
+  local previous_hash
+  local current_hash
+
+  ensure_state_dir
+  previous_status=$(state_read "${STATE_DIR}/check-status")
+  previous_hash=$(state_read "${STATE_DIR}/check-hash")
+  error_text=$(printf '%s\n' "$error_text" | sanitize_text | tail -20)
+  [[ -n "$error_text" ]] || error_text="Unknown update-check failure"
+  current_hash=$(printf '%s\n' "$error_text" | hash_text)
+
+  if [[ "$previous_status" != "failure" || "$previous_hash" != "$current_hash" ]]; then
+    if ! send_ntfy "Update check failed" "warning" "$error_text"; then
+      log "failed to send ntfy failure notification"
+      return 1
+    fi
+  fi
+  atomic_write "${STATE_DIR}/check-status" "failure"
+  atomic_write "${STATE_DIR}/check-hash" "$current_hash"
+}
+
+run_check() {
+  local output_file
+  local error_file
+  local normalized
+  local rc
+
+  output_file=$(mktemp)
+  error_file=$(mktemp)
+
+  set +e
+  ( collect_updates ) >"$output_file" 2>"$error_file"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -ne 0 ]]; then
+    if ! process_check_failure "$(cat "$error_file")"; then
+      rm -f "$output_file" "$error_file"
+      return 1
+    fi
+    rm -f "$output_file" "$error_file"
+    return "$rc"
+  fi
+
+  normalized=$(cat "$output_file")
+  rm -f "$output_file" "$error_file"
+  process_check_success "$normalized"
+}
+
+manual_run_marker_present() {
+  grep -Eq 'Updating Host|Update only LXC/VM|--- PVE UPDATE ---|Updating LXC|Updating VM'
+}
+
+manual_failure_details() {
+  local error_log
+  error_log=$(read_updater_value ERROR_LOG_FILE || true)
+  if [[ -n "$error_log" && -r "$error_log" && -s "$error_log" ]]; then
+    printf '\n\nRecent Ultimate Updater error details:\n'
+    tail -30 "$error_log" | sanitize_text
+  fi
+}
+
+observe_manual() {
+  local clean_log
+  local outcome
+  local title
+  local tags
+  local details
+  local signature
+  local now
+  local previous_signature
+  local previous_time
+
+  [[ -r "$UPDATER_LOG" ]] || return 0
+  ensure_state_dir
+  clean_log=$(sanitize_text <"$UPDATER_LOG")
+
+  if ! printf '%s\n' "$clean_log" | manual_run_marker_present; then
+    return 0
+  fi
+
+  if grep -q 'Finished, with errors\.' <<<"$clean_log"; then
+    outcome="with-errors"
+    title="Manual update finished with errors"
+    tags="warning"
+  elif grep -q 'Error during update --- Exit Code:' <<<"$clean_log"; then
+    outcome="failure"
+    title="Manual update failed"
+    tags="x"
+  elif grep -q 'Finished, all updates done\.' <<<"$clean_log"; then
+    outcome="success"
+    title="Manual update succeeded"
+    tags="white_check_mark"
+  else
+    return 0
+  fi
+
+  details=$(printf '%s\n' "$clean_log" | tail -40)
+  if [[ "$outcome" != "success" ]]; then
+    details+=$(manual_failure_details)
+  fi
+
+  # Upstream rewrites the log during cleanup after printing the terminal marker.
+  # Hash only stable run/outcome markers so the resulting second path event does
+  # not create a duplicate notification. A later identical run still notifies
+  # once the short time window has elapsed.
+  signature=$(
+    {
+      printf '%s\n' "$outcome"
+      printf '%s\n' "$clean_log" | grep -E 'Updating Host|Update only LXC/VM|--- PVE UPDATE ---|Updating LXC|Updating VM|Finished, with errors\.|Error during update --- Exit Code:|Finished, all updates done\.' || true
+    } | hash_text
+  )
+  now=$(date +%s)
+  previous_signature=$(state_read "${STATE_DIR}/manual-signature")
+  previous_time=$(state_read "${STATE_DIR}/manual-time")
+  previous_time=${previous_time:-0}
+
+  if [[ "$signature" == "$previous_signature" ]] && ((now - previous_time < MANUAL_DEDUPE_SECONDS)); then
+    return 0
+  fi
+
+  send_ntfy "$title" "$tags" "$details"
+  atomic_write "${STATE_DIR}/manual-signature" "$signature"
+  atomic_write "${STATE_DIR}/manual-time" "$now"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: proxmox-ultimate-updater-notify <check|observe-manual>
+
+  check           Refresh APT metadata and report available updates without installing packages.
+  observe-manual  Inspect the Ultimate Updater log and notify on completed operator-triggered runs.
+EOF
+}
+
+main() {
+  case "${1:-}" in
+    check)
+      run_check
+      ;;
+    observe-manual)
+      observe_manual
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"
