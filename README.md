@@ -146,7 +146,7 @@ CI also runs Bash syntax checks, ShellCheck, the behavior suite, and systemd uni
 - Unsupported or unsafe target conditions fail rather than falling back to an upstream mutating check path.
 - The upstream Ultimate Updater remains responsible for its own package-installation behavior and authorization.
 
-Security-sensitive issues can be reported through GitHub's standard repository issue mechanism without including credentials, tokens, private hostnames, or other sensitive environment details.
+Security-sensitive issues should be reported through GitHub Private Vulnerability Reporting for this repository. Use normal GitHub Issues only for non-sensitive bugs, questions, and security discussions that do not contain credentials, tokens, private hostnames, exploit details, or other sensitive environment information.
 
 ## License and upstream relationship
 

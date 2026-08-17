@@ -3,7 +3,17 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish"
+        required: true
+        type: string
+      expected_sha:
+        description: "Exact 40-character release source commit SHA"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,17 +21,35 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.sha }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
-      - name: Verify release version
+      - name: Require public repository and exact release source
+        shell: bash
         run: |
-          expected="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          test "${{ github.event.repository.private }}" = "false"
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${EXPECTED_SHA}" =~ ^[0-9a-f]{40}$ ]]
           actual="$(tr -d '\r\n' < VERSION)"
-          test "$actual" = "$expected"
+          test "${RELEASE_TAG}" = "v${actual}"
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "${EXPECTED_SHA}"
+          test "$(git rev-list -n1 "${RELEASE_TAG}")" = "${EXPECTED_SHA}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            test "${EXPECTED_SHA}" = "$(git rev-parse origin/main)"
+          else
+            git merge-base --is-ancestor "${EXPECTED_SHA}" origin/main
+          fi
 
       - name: Run release checks
         run: |
@@ -34,17 +62,24 @@ jobs:
           systemd-analyze verify systemd/*.service systemd/*.timer systemd/*.path
 
       - name: Build source archive and checksum
+        shell: bash
         run: |
-          archive="proxmox-ultimate-updater-notify-${GITHUB_REF_NAME}.tar.gz"
-          git archive --format=tar.gz --prefix="proxmox-ultimate-updater-notify-${GITHUB_REF_NAME}/" -o "$archive" "$GITHUB_SHA"
+          set -euo pipefail
+          archive="proxmox-ultimate-updater-notify-${RELEASE_TAG}.tar.gz"
+          git archive --format=tar.gz --prefix="proxmox-ultimate-updater-notify-${RELEASE_TAG}/" -o "$archive" "${EXPECTED_SHA}"
           sha256sum "$archive" > SHA256SUMS
 
-      - name: Publish GitHub release
+      - name: Create draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "proxmox-ultimate-updater-notify-${GITHUB_REF_NAME}.tar.gz" \
-            SHA256SUMS \
-            --verify-tag \
-            --generate-notes
+        run: gh release create "${RELEASE_TAG}" --draft --verify-tag --title "Proxmox Ultimate Updater Notify ${RELEASE_TAG}" --generate-notes
+
+      - name: Attach release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${RELEASE_TAG}" "proxmox-ultimate-updater-notify-${RELEASE_TAG}.tar.gz" SHA256SUMS
+
+      - name: Publish immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${RELEASE_TAG}" --draft=false
