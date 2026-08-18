@@ -69,15 +69,26 @@ jobs:
           git archive --format=tar.gz --prefix="proxmox-ultimate-updater-notify-${RELEASE_TAG}/" -o "$archive" "${EXPECTED_SHA}"
           sha256sum "$archive" > SHA256SUMS
 
-      - name: Create draft GitHub Release
+      - name: Create or reuse draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${RELEASE_TAG}" --draft --verify-tag --title "Proxmox Ultimate Updater Notify ${RELEASE_TAG}" --generate-notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            test "$(gh release view "${RELEASE_TAG}" --json isDraft --jq '.isDraft')" = "true" || {
+              echo "error: ${RELEASE_TAG} already exists and is published; refusing to mutate an immutable release" >&2
+              exit 1
+            }
+            echo "Reusing existing draft release ${RELEASE_TAG}"
+          else
+            gh release create "${RELEASE_TAG}" --draft --verify-tag --title "Proxmox Ultimate Updater Notify ${RELEASE_TAG}" --generate-notes
+          fi
 
       - name: Attach release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${RELEASE_TAG}" "proxmox-ultimate-updater-notify-${RELEASE_TAG}.tar.gz" SHA256SUMS
+        run: gh release upload "${RELEASE_TAG}" "proxmox-ultimate-updater-notify-${RELEASE_TAG}.tar.gz" SHA256SUMS --clobber
 
       - name: Publish immutable GitHub Release
         env:
