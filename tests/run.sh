@@ -150,7 +150,10 @@ case "$cmd" in
     exit 0
     ;;
   *"LC_ALL=C apt-get -s upgrade"*) cat "$TEST_FIXTURE/apt-output" ;;
-  *"test -f /var/run/reboot-required.pkgs"*) exit 1 ;;
+  *"test -f /var/run/reboot-required.pkgs"*)
+    [[ "${TEST_REBOOT_REQUIRED:-false}" == "true" ]] && exit 0
+    exit 1
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -171,7 +174,7 @@ EOF
 
 cleanup_fixture() {
   rm -rf "$FIXTURE"
-  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
+  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_REBOOT_REQUIRED TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
 }
 
 count_curl() {
@@ -491,6 +494,10 @@ new_fixture
 bash "$APP" check
 assert "non-root SSH metadata refresh matches existing Ultimate Updater sudo rule" grep -Fq "sudo -n /usr/bin/apt-get update -y" "$FIXTURE/ssh-log"
 assert "first available-update state notifies" test "$(count_curl)" -eq 1
+assert "available-update notification enables ntfy Markdown" grep -Fq "Markdown: yes" "$FIXTURE/curl-stdin"
+assert "available-update notification uses a compact Markdown summary" grep -Fq '**1 target · 1 update · 0 security · no reboot**' "$FIXTURE/curl-args"
+assert "available-update notification groups packages under the target" grep -Fq '### VM 101 · docker' "$FIXTURE/curl-args"
+assert "available-update notification shows package and destination version" grep -Fq -- "- \`package-a\` → \`1.1\`" "$FIXTURE/curl-args"
 bash "$APP" check
 assert "unchanged update state is deduplicated" test "$(count_curl)" -eq 1
 printf 'Inst package-b [2.0] (2.1 stable [amd64])\n' >"$FIXTURE/apt-output"
@@ -499,6 +506,22 @@ assert "changed update state notifies" test "$(count_curl)" -eq 2
 : >"$FIXTURE/apt-output"
 bash "$APP" check
 assert "cleared update state notifies" test "$(count_curl)" -eq 3
+cleanup_fixture
+
+# Security updates are visible in the compact Markdown notification.
+new_fixture
+printf 'Inst libexpat1 [2.8.2-1~deb13u1] (2.8.3-1~deb13u1 Debian-Security:13/stable-security [amd64])\n' >"$FIXTURE/apt-output"
+bash "$APP" check
+assert "security update count is summarized" grep -Fq '**1 target · 1 update · 1 security · no reboot**' "$FIXTURE/curl-args"
+assert "security package is visually marked" grep -Fq -- "- 🔐 \`libexpat1\` → \`2.8.3-1~deb13u1\`" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Reboot-required state remains explicit in the compact Markdown notification.
+new_fixture
+export TEST_REBOOT_REQUIRED=true
+bash "$APP" check
+assert "reboot-required target is summarized" grep -Fq '**1 target · 1 update · 0 security · 1 reboot required**' "$FIXTURE/curl-args"
+assert "reboot-required target is visibly called out" grep -Fq -- '- **Reboot required**' "$FIXTURE/curl-args"
 cleanup_fixture
 
 # Failed ntfy delivery must not poison failure dedupe state.
