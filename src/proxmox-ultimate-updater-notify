@@ -75,6 +75,7 @@ send_ntfy() {
   local title=$1
   local tags=$2
   local message=$3
+  local markdown=${4:-false}
   local token
 
   load_config
@@ -86,6 +87,9 @@ send_ntfy() {
     printf 'Authorization: Bearer %s\n' "$token"
     printf 'Title: %s\n' "${NTFY_TITLE_PREFIX}: ${title}"
     [[ -n "$tags" ]] && printf 'Tags: %s\n' "$tags"
+    if [[ "$markdown" == "true" ]]; then
+      printf 'Markdown: yes\n'
+    fi
   } | curl \
     --fail \
     --silent \
@@ -591,12 +595,80 @@ format_update_message() {
   local normalized=$1
   local target_count
   local package_count
-  local summary
+  local security_count
+  local reboot_count
+  local target_word
+  local update_word
+  local reboot_summary
+  local line
+  local type
+  local id
+  local name
+  local reboot_field
+  local raw_package
+  local package_name
+  local new_version
+  local security_marker
 
   target_count=$(printf '%s\n' "$normalized" | grep -c '^target|' || true)
   package_count=$(printf '%s\n' "$normalized" | grep -c '^package|' || true)
-  summary=$(printf '%s\n' "$normalized" | sed -n '1,40p' | sed 's/^target|/Target: /; s/^package|/  /')
-  printf '%s target(s), %s package update(s) or reboot state changes.\n\n%s' "$target_count" "$package_count" "$summary"
+  security_count=$(printf '%s\n' "$normalized" | awk -F'|' '
+    $1 == "target" {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^security=/) {
+          sub(/^security=/, "", $i)
+          total += $i
+        }
+      }
+    }
+    END { print total + 0 }
+  ')
+  reboot_count=$(printf '%s\n' "$normalized" | grep -c '^target|.*|reboot=yes$' || true)
+
+  [[ "$target_count" -eq 1 ]] && target_word=target || target_word=targets
+  [[ "$package_count" -eq 1 ]] && update_word=update || update_word=updates
+  if [[ "$reboot_count" -eq 0 ]]; then
+    reboot_summary="no reboot"
+  elif [[ "$reboot_count" -eq 1 ]]; then
+    reboot_summary="1 reboot required"
+  else
+    reboot_summary="$reboot_count reboots required"
+  fi
+
+  printf '**%s %s · %s %s · %s security · %s**\n' \
+    "$target_count" "$target_word" "$package_count" "$update_word" "$security_count" "$reboot_summary"
+
+  while IFS= read -r line; do
+    case "$line" in
+      target\|*)
+        IFS='|' read -r _ type id name _ _ reboot_field <<<"$line"
+        case "$type" in
+          host) printf '\n### Host · %s\n' "$name" ;;
+          lxc) printf '\n### LXC %s · %s\n' "$id" "$name" ;;
+          vm) printf '\n### VM %s · %s\n' "$id" "$name" ;;
+          *) printf '\n### %s %s · %s\n' "$type" "$id" "$name" ;;
+        esac
+        if [[ "$reboot_field" == "reboot=yes" ]]; then
+          printf '%s\n' '- **Reboot required**'
+        fi
+        ;;
+      package\|*)
+        raw_package=${line#package|}
+        package_name=${raw_package#Inst }
+        package_name=${package_name%% *}
+        new_version=$(printf '%s\n' "$raw_package" | sed -nE 's/^Inst [^ ]+( \[[^]]+\])? \(([^ )]+).*/\2/p')
+        security_marker=""
+        if printf '%s\n' "$raw_package" | grep -qiE '(security|updates-security)'; then
+          security_marker="🔐 "
+        fi
+        if [[ -n "$new_version" ]]; then
+          printf -- "- %s\`%s\` → \`%s\`\n" "$security_marker" "$package_name" "$new_version"
+        else
+          printf -- "- %s\`%s\` — update available\n" "$security_marker" "$package_name"
+        fi
+        ;;
+    esac
+  done < <(printf '%s\n' "$normalized" | sed -n '1,40p')
 }
 
 process_check_success() {
@@ -618,12 +690,12 @@ process_check_success() {
       fi
     fi
     if [[ "$previous_status" != "updates" ]]; then
-      if ! send_ntfy "Updates available" "package" "$(format_update_message "$normalized")"; then
+      if ! send_ntfy "Updates available" "package" "$(format_update_message "$normalized")" true; then
         log "failed to send ntfy updates-available notification"
         return 1
       fi
     elif [[ "$previous_hash" != "$current_hash" ]]; then
-      if ! send_ntfy "Available updates changed" "package" "$(format_update_message "$normalized")"; then
+      if ! send_ntfy "Available updates changed" "package" "$(format_update_message "$normalized")" true; then
         log "failed to send ntfy changed-updates notification"
         return 1
       fi

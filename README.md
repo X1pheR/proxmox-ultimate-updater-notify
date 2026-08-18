@@ -33,6 +33,8 @@ The notifier sends ntfy messages when:
 
 Unchanged automatic and compatibility states are deduplicated. Multiple filesystem events from the same completed manual run are suppressed for a short window, while later identical manual runs still notify independently.
 
+Update-availability and changed-update notifications use ntfy Markdown for a compact mobile-friendly summary, per-target headings, package/version bullets, security markers, and explicit reboot-required callouts. Health, failure, recovery, and manual-run messages remain plain text.
+
 ## Compatibility
 
 The initial compatibility baseline is intentionally narrow:
