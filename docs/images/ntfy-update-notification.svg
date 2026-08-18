@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="610" viewBox="0 0 1000 610" role="img" aria-labelledby="title desc">
+  <title id="title">Synthetic ntfy update notification preview</title>
+  <desc id="desc">A dark ntfy-style notification showing three targets, six updates, three security updates, and one reboot-required virtual machine.</desc>
+  <rect width="1000" height="610" rx="6" fill="#24292e"/>
+  <text x="30" y="38" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="17" font-weight="700">Example</text>
+  <g stroke="#ffffff" stroke-width="3" stroke-linecap="round">
+    <line x1="962" y1="27" x2="978" y2="43"/>
+    <line x1="978" y1="27" x2="962" y2="43"/>
+  </g>
+
+  <text x="30" y="78" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="28" font-weight="600">📦  Ultimate Updater: Updates available</text>
+  <text x="30" y="111" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="20" font-weight="700">3 targets · 6 updates · 3 security · 1 reboot required</text>
+
+  <text x="30" y="160" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="22" font-weight="700">Host · proxmox</text>
+  <text x="30" y="207" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">•  🔐 openssl → 3.0.15-1~deb13u1</text>
+  <text x="30" y="244" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">•  🔐 libssl3 → 3.0.15-1~deb13u1</text>
+
+  <text x="30" y="296" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="22" font-weight="700">LXC 201 · dns</text>
+  <text x="30" y="343" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">•  🔐 bind9-host → 1:9.20.11-4</text>
+
+  <text x="30" y="395" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="22" font-weight="700">VM 301 · docker-host</text>
+  <text x="30" y="434" fill="#ffffff" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="18" font-weight="700">•  Reboot required</text>
+  <text x="30" y="475" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">•  docker-ce-cli → 5:28.4.0-1~ubuntu.24.04~noble</text>
+  <text x="30" y="516" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">•  linux-image-generic → 6.8.0.79.81</text>
+  <text x="30" y="557" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">•  linux-tools-common → 6.8.0-79.79</text>
+
+  <text x="30" y="592" fill="#aeb6bf" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="14">Synthetic example data · no real hostnames, VM IDs, or package state</text>
+</svg>
