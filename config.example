@@ -7,3 +7,8 @@ NTFY_URL="https://ntfy.example.com/ultimate-updater"
 NTFY_TOKEN_FILE="/etc/proxmox-ultimate-updater-notify/ntfy-token"
 
 NTFY_TITLE_PREFIX="Ultimate Updater"
+
+# Optional: publish successful systemd-scheduled checks to a Gatus external endpoint.
+# Leave both values empty to disable heartbeat delivery.
+GATUS_HEARTBEAT_URL=""
+GATUS_HEARTBEAT_TOKEN_FILE=""

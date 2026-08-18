@@ -53,6 +53,8 @@ EOF
 VERSION="5.0"
 EOF
   : >"$FIXTURE/crontab"
+  mkdir -p "$FIXTURE/cron.d"
+  : >"$FIXTURE/system-crontab"
   cat >"$FIXTURE/updater/VMs/101" <<'EOF'
 IP="192.0.2.101"
 USER="ronald"
@@ -63,6 +65,7 @@ EOF
   : >"$FIXTURE/curl-stdin"
   : >"$FIXTURE/curl-count"
   : >"$FIXTURE/ssh-log"
+  : >"$FIXTURE/timeout-log"
 
   cat >"$FIXTURE/bin/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -70,6 +73,12 @@ printf '%s\n' "$*" >>"$TEST_FIXTURE/curl-args"
 cat >>"$TEST_FIXTURE/curl-stdin"
 printf '1\n' >>"$TEST_FIXTURE/curl-count"
 if [[ "${TEST_CURL_FAIL:-false}" == "true" ]]; then
+  exit 22
+fi
+if [[ "${TEST_HEARTBEAT_FAIL:-false}" == "true" && "$*" == *"gatus.example.invalid"* ]]; then
+  exit 22
+fi
+if [[ "${TEST_NTFY_FAIL:-false}" == "true" && "$*" == *"ntfy.example.invalid"* ]]; then
   exit 22
 fi
 exit 0
@@ -122,6 +131,13 @@ case "$1" in
 esac
 EOF
 
+  cat >"$FIXTURE/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$TEST_FIXTURE/timeout-log"
+shift 3
+exec "$@"
+EOF
+
   cat >"$FIXTURE/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$TEST_FIXTURE/ssh-log"
@@ -148,12 +164,14 @@ EOF
   export PUUN_UPDATER_CONFIG="$FIXTURE/updater/update.conf"
   export PUUN_UPDATER_LOG="$FIXTURE/ultimate-updater.log"
   export PUUN_CRONTAB="$FIXTURE/bin/crontab"
+  export PUUN_SYSTEM_CRONTAB="$FIXTURE/system-crontab"
+  export PUUN_CRON_D_DIR="$FIXTURE/cron.d"
   export PUUN_SYSTEMCTL="$FIXTURE/bin/systemctl"
 }
 
 cleanup_fixture() {
   rm -rf "$FIXTURE"
-  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_MANUAL_PATH_INACTIVE PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL
+  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
 }
 
 count_curl() {
@@ -164,6 +182,8 @@ count_curl() {
 assert "main script parses" bash -n "$APP"
 assert "installer parses" bash -n "$INSTALLER"
 assert "test script parses" bash -n "$0"
+assert "automatic check service has a hard runtime cap" grep -Fqx "TimeoutStartSec=10min" "$REPO_DIR/systemd/proxmox-ultimate-updater-notify-check.service"
+assert "automatic check service marks scheduled runs" grep -Fqx "Environment=PUUN_SCHEDULED_RUN=true" "$REPO_DIR/systemd/proxmox-ultimate-updater-notify-check.service"
 if grep -nE '(^|[^-])\b(dnf|yum)[[:space:]].*(update|upgrade)|pacman[[:space:]].*-Syu|apk[[:space:]].*upgrade|apt-get[[:space:]]+(upgrade|dist-upgrade|full-upgrade)' "$APP"; then
   fail "automatic checker contains no package-install command"
 else
@@ -184,6 +204,34 @@ health_cron_rc=$?
 set -e
 assert "reintroduced upstream check cron fails compatibility health" test "$health_cron_rc" -ne 0
 assert "compatibility health failure sends a dedicated ntfy warning" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
+cleanup_fixture
+
+# Compatibility health must also inspect system-wide cron sources.
+new_fixture
+mkdir -p "$FIXTURE/cron.d"
+printf '00 06 * * * root RUN_FROM_CRON=true /usr/local/sbin/update -check >/dev/null 2>&1\n' >"$FIXTURE/system-crontab"
+export PUUN_SYSTEM_CRONTAB="$FIXTURE/system-crontab"
+export PUUN_CRON_D_DIR="$FIXTURE/cron.d"
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_system_cron_rc=$?
+set -e
+assert "system crontab upstream checker fails compatibility health" test "$health_system_cron_rc" -ne 0
+assert "system crontab failure sends compatibility warning" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
+cleanup_fixture
+
+new_fixture
+mkdir -p "$FIXTURE/cron.d"
+: >"$FIXTURE/system-crontab"
+printf '00 06 * * * root /etc/ultimate-updater/check-updates.sh >/dev/null 2>&1\n' >"$FIXTURE/cron.d/ultimate-updater"
+export PUUN_SYSTEM_CRONTAB="$FIXTURE/system-crontab"
+export PUUN_CRON_D_DIR="$FIXTURE/cron.d"
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_crond_rc=$?
+set -e
+assert "cron.d upstream checker fails compatibility health" test "$health_crond_rc" -ne 0
+assert "cron.d failure sends compatibility warning" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
 cleanup_fixture
 
 # Compatibility health must fail closed if root-crontab inspection is unavailable.
@@ -382,6 +430,62 @@ set -e
 assert "upstream tag filter is isolated from companion nounset" test "$tag_filter_rc" -eq 0
 cleanup_fixture
 
+# Scheduled successful checks publish a Gatus external-endpoint heartbeat.
+new_fixture
+printf 'gatus-heartbeat-secret\n' >"$FIXTURE/gatus-token"
+cat >>"$FIXTURE/config" <<EOF
+GATUS_HEARTBEAT_URL="https://gatus.example.invalid/api/v1/endpoints/proxmox_ultimate-updater/external"
+GATUS_HEARTBEAT_TOKEN_FILE="$FIXTURE/gatus-token"
+EOF
+export PUUN_SCHEDULED_RUN=true
+bash "$APP" check
+assert "scheduled successful check publishes Gatus heartbeat" grep -Fq "gatus.example.invalid/api/v1/endpoints/proxmox_ultimate-updater/external?success=true" "$FIXTURE/curl-args"
+assert "Gatus heartbeat token is absent from curl argv" not_grep_fixed "gatus-heartbeat-secret" "$FIXTURE/curl-args"
+assert "Gatus heartbeat token is delivered through curl stdin" grep -Fq "Authorization: Bearer gatus-heartbeat-secret" "$FIXTURE/curl-stdin"
+assert "outbound notification and heartbeat HTTP calls are time-bounded" test "$(grep -Fc -- '--connect-timeout 10 --max-time 30' "$FIXTURE/curl-args")" -eq "$(count_curl)"
+cleanup_fixture
+
+# A scheduled heartbeat is emitted only after normal check-state notification succeeds.
+new_fixture
+printf 'gatus-heartbeat-secret\n' >"$FIXTURE/gatus-token"
+cat >>"$FIXTURE/config" <<EOF
+GATUS_HEARTBEAT_URL="https://gatus.example.invalid/api/v1/endpoints/proxmox_ultimate-updater/external"
+GATUS_HEARTBEAT_TOKEN_FILE="$FIXTURE/gatus-token"
+EOF
+export PUUN_SCHEDULED_RUN=true
+export TEST_NTFY_FAIL=true
+set +e
+bash "$APP" check >/dev/null 2>&1
+ntfy_before_heartbeat_rc=$?
+set -e
+assert "ntfy delivery failure keeps scheduled check non-zero" test "$ntfy_before_heartbeat_rc" -ne 0
+assert "failed normal notification does not advance Gatus heartbeat" not_grep_fixed "gatus.example.invalid" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Failed scheduled heartbeat is a check failure and is reported through ntfy.
+new_fixture
+printf 'gatus-heartbeat-secret\n' >"$FIXTURE/gatus-token"
+cat >>"$FIXTURE/config" <<EOF
+GATUS_HEARTBEAT_URL="https://gatus.example.invalid/api/v1/endpoints/proxmox_ultimate-updater/external"
+GATUS_HEARTBEAT_TOKEN_FILE="$FIXTURE/gatus-token"
+EOF
+export PUUN_SCHEDULED_RUN=true
+export TEST_HEARTBEAT_FAIL=true
+set +e
+bash "$APP" check >/dev/null 2>&1
+heartbeat_fail_rc=$?
+set -e
+assert "failed scheduled heartbeat keeps check non-zero" test "$heartbeat_fail_rc" -ne 0
+assert "failed scheduled heartbeat persists check failure state" grep -Fqx "failure" "$FIXTURE/state/check-status"
+assert "failed scheduled heartbeat is reported through ntfy" grep -Fq "Gatus heartbeat delivery failed" "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Potentially long-running target operations are bounded by GNU timeout.
+new_fixture
+bash "$APP" check
+assert "automatic target operations use bounded command timeout" grep -Fq "120s ssh -q" "$FIXTURE/timeout-log"
+cleanup_fixture
+
 # Safe non-root SSH APT metadata refresh and update-state deduplication.
 new_fixture
 bash "$APP" check
@@ -425,8 +529,19 @@ cleanup_fixture
 
 # Install -> reinstall -> uninstall, config preservation, cron replacement/restoration.
 INSTALL_FIXTURE=$(mktemp -d)
-mkdir -p "$INSTALL_FIXTURE/bin" "$INSTALL_FIXTURE/root"
+mkdir -p "$INSTALL_FIXTURE/bin" "$INSTALL_FIXTURE/root/etc/cron.d"
 CRON_STORE="$INSTALL_FIXTURE/crontab"
+SYSTEM_CRON_STORE="$INSTALL_FIXTURE/root/etc/crontab"
+CRON_D_STORE="$INSTALL_FIXTURE/root/etc/cron.d/ultimate-updater"
+cat >"$SYSTEM_CRON_STORE" <<'EOF'
+17 * * * * root cd / && run-parts --report /etc/cron.hourly
+00 06 * * * root RUN_FROM_CRON=true /usr/local/sbin/update -check >/dev/null 2>&1
+EOF
+cat >"$CRON_D_STORE" <<'EOF'
+# keep this comment
+30 4 * * * root /etc/ultimate-updater/check-updates.sh >/dev/null 2>&1
+EOF
+printf '15 3 * * * root /usr/local/bin/housekeeping\n' >"$INSTALL_FIXTURE/root/etc/cron.d/housekeeping"
 cat >"$CRON_STORE" <<'EOF'
 5 * * * * echo keep-me
 15 2 * * * /etc/ultimate-updater/update.sh host
@@ -445,6 +560,11 @@ chmod +x "$INSTALL_FIXTURE/bin/crontab"
 export TEST_CRON_STORE="$CRON_STORE"
 PUUN_ROOT_PREFIX="$INSTALL_FIXTURE/root" PUUN_CRONTAB="$INSTALL_FIXTURE/bin/crontab" bash "$INSTALLER" install
 assert "installer removes upstream update-check cron" not_grep_fixed "update -check" "$CRON_STORE"
+assert "installer removes system crontab upstream checker" not_grep_fixed "update -check" "$SYSTEM_CRON_STORE"
+assert "installer removes cron.d upstream checker" not_grep_fixed "check-updates.sh" "$CRON_D_STORE"
+assert "installer preserves system crontab unrelated line" grep -Fq "run-parts --report /etc/cron.hourly" "$SYSTEM_CRON_STORE"
+assert "installer preserves cron.d unrelated content" grep -Fq "# keep this comment" "$CRON_D_STORE"
+assert "installer does not persist empty backup for unrelated cron.d source" test ! -e "$INSTALL_FIXTURE/root/var/lib/proxmox-ultimate-updater-notify/original-update-check-cron-d/housekeeping"
 assert "installer preserves unrelated cron" grep -Fq "keep-me" "$CRON_STORE"
 assert "installer does not remove scheduled non-check update.sh commands" grep -Fq "/etc/ultimate-updater/update.sh host" "$CRON_STORE"
 CONFIG_PATH="$INSTALL_FIXTURE/root/etc/proxmox-ultimate-updater-notify/config"
@@ -458,6 +578,8 @@ printf 'fingerprint\n' >"$STATE_PATH/upstream-fingerprint"
 printf '5.0\n' >"$STATE_PATH/upstream-version"
 PUUN_ROOT_PREFIX="$INSTALL_FIXTURE/root" PUUN_CRONTAB="$INSTALL_FIXTURE/bin/crontab" bash "$INSTALLER" uninstall
 assert "uninstall restores original update-check cron" grep -Fq "/usr/local/sbin/update -check" "$CRON_STORE"
+assert "uninstall restores system crontab upstream checker" grep -Fq "RUN_FROM_CRON=true /usr/local/sbin/update -check" "$SYSTEM_CRON_STORE"
+assert "uninstall restores cron.d upstream checker" grep -Fq "/etc/ultimate-updater/check-updates.sh" "$CRON_D_STORE"
 assert "uninstall removes compatibility health state" test ! -e "$STATE_PATH/health-status" -a ! -e "$STATE_PATH/health-hash" -a ! -e "$STATE_PATH/upstream-fingerprint" -a ! -e "$STATE_PATH/upstream-version"
 assert "uninstall preserves operator config and token directory" grep -Fq 'LOCAL_OPERATOR_VALUE="preserve-me"' "$CONFIG_PATH"
 rm -rf "$INSTALL_FIXTURE"
