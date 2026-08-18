@@ -8,6 +8,11 @@ CONFIG_DIR="${PREFIX}/etc/${APP}"
 SYSTEMD_DIR="${PREFIX}/etc/systemd/system"
 STATE_DIR="${PREFIX}/var/lib/${APP}"
 CRON_BACKUP="${STATE_DIR}/original-update-check-cron"
+SYSTEM_CRON_BACKUP="${STATE_DIR}/original-update-check-system-crontab"
+CRON_D_BACKUP_DIR="${STATE_DIR}/original-update-check-cron-d"
+CRON_D_INITIALIZED="${STATE_DIR}/cron-d-initialized"
+SYSTEM_CRONTAB="${PUUN_SYSTEM_CRONTAB:-${PREFIX}/etc/crontab}"
+CRON_D_DIR="${PUUN_CRON_D_DIR:-${PREFIX}/etc/cron.d}"
 SYSTEMCTL="${PUUN_SYSTEMCTL:-systemctl}"
 CRONTAB="${PUUN_CRONTAB:-crontab}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -87,6 +92,109 @@ migrate_updater_cron() {
   rm -f "$current" "$kept"
 }
 
+filter_cron_file() {
+  local source=$1
+  local backup=$2
+  local capture_original=$3
+  local kept
+  local line
+  local found=false
+
+  [[ -f "$source" ]] || return 0
+  kept=$(mktemp)
+  if [[ "$capture_original" == true ]]; then
+    : >"$backup"
+    chmod 0600 "$backup"
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if is_updater_check_cron "$line"; then
+      found=true
+      if [[ "$capture_original" == true ]]; then
+        printf '%s\n' "$line" >>"$backup"
+      fi
+    else
+      printf '%s\n' "$line" >>"$kept"
+    fi
+  done <"$source"
+
+  if [[ "$found" == true ]]; then
+    cat "$kept" >"$source"
+  fi
+  rm -f "$kept"
+}
+
+migrate_system_cron() {
+  local capture=true
+
+  install -d -m 0700 "$STATE_DIR"
+  if [[ -e "$SYSTEM_CRON_BACKUP" ]]; then
+    capture=false
+  fi
+  filter_cron_file "$SYSTEM_CRONTAB" "$SYSTEM_CRON_BACKUP" "$capture"
+  if [[ "$capture" == true && ! -e "$SYSTEM_CRON_BACKUP" ]]; then
+    : >"$SYSTEM_CRON_BACKUP"
+    chmod 0600 "$SYSTEM_CRON_BACKUP"
+  fi
+}
+
+migrate_cron_d() {
+  local cron_file
+  local backup
+  local capture=false
+
+  install -d -m 0700 "$STATE_DIR" "$CRON_D_BACKUP_DIR"
+  [[ ! -e "$CRON_D_INITIALIZED" ]] && capture=true
+  if [[ -d "$CRON_D_DIR" ]]; then
+    for cron_file in "$CRON_D_DIR"/*; do
+      [[ -f "$cron_file" ]] || continue
+      backup="$CRON_D_BACKUP_DIR/$(basename "$cron_file")"
+      if [[ "$capture" == true ]]; then
+        filter_cron_file "$cron_file" "$backup" true
+        [[ -s "$backup" ]] || rm -f "$backup"
+      else
+        filter_cron_file "$cron_file" "$backup" false
+      fi
+    done
+  fi
+  : >"$CRON_D_INITIALIZED"
+  chmod 0600 "$CRON_D_INITIALIZED"
+}
+
+restore_cron_file_lines() {
+  local source=$1
+  local backup=$2
+  local line
+
+  [[ -s "$backup" ]] || return 0
+  if [[ ! -e "$source" ]]; then
+    install -d -m 0755 "$(dirname "$source")"
+    install -m 0644 /dev/null "$source"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    if ! grep -Fqx -- "$line" "$source"; then
+      printf '%s\n' "$line" >>"$source"
+    fi
+  done <"$backup"
+}
+
+restore_system_cron() {
+  restore_cron_file_lines "$SYSTEM_CRONTAB" "$SYSTEM_CRON_BACKUP"
+}
+
+restore_cron_d() {
+  local backup
+  local source
+
+  [[ -d "$CRON_D_BACKUP_DIR" ]] || return 0
+  for backup in "$CRON_D_BACKUP_DIR"/*; do
+    [[ -f "$backup" ]] || continue
+    source="$CRON_D_DIR/$(basename "$backup")"
+    restore_cron_file_lines "$source" "$backup"
+  done
+}
+
 restore_updater_cron() {
   local current
   local merged
@@ -125,6 +233,8 @@ install_product() {
   fi
 
   migrate_updater_cron
+  migrate_system_cron
+  migrate_cron_d
 
   if ! is_test_root; then
     "$SYSTEMCTL" daemon-reload
@@ -141,6 +251,8 @@ uninstall_product() {
   fi
 
   restore_updater_cron
+  restore_system_cron
+  restore_cron_d
   rm -f \
     "$SYSTEMD_DIR/$APP-check.service" \
     "$SYSTEMD_DIR/$APP-check.timer" \
@@ -151,6 +263,8 @@ uninstall_product() {
   # Preserve operator configuration and ntfy token by design.
   rm -f \
     "$CRON_BACKUP" \
+    "$SYSTEM_CRON_BACKUP" \
+    "$CRON_D_INITIALIZED" \
     "$STATE_DIR/check-status" \
     "$STATE_DIR/check-hash" \
     "$STATE_DIR/health-status" \
@@ -159,6 +273,10 @@ uninstall_product() {
     "$STATE_DIR/upstream-version" \
     "$STATE_DIR/manual-signature" \
     "$STATE_DIR/manual-time"
+  if [[ -d "$CRON_D_BACKUP_DIR" ]]; then
+    rm -f "$CRON_D_BACKUP_DIR"/*
+    rmdir "$CRON_D_BACKUP_DIR" 2>/dev/null || true
+  fi
   rmdir "$STATE_DIR" 2>/dev/null || true
 
   if ! is_test_root; then

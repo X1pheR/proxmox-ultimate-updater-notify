@@ -55,7 +55,7 @@ Before every automatic update check, the notifier also validates the upstream in
 - the upstream `update.sh` entrypoint still exposes a readable version marker;
 - `tag-filter.sh` is present and its `apply_only_exclude_tags` interface remains callable;
 - Ultimate Updater's configured `LOG_FILE` still matches the manual observer path;
-- no upstream automatic `update -check`/`check-updates.sh` root-cron entry has reappeared;
+- no upstream automatic `update -check`/`check-updates.sh` entry has reappeared in root's user crontab, `/etc/crontab`, or `/etc/cron.d`;
 - the companion's check timer and manual path watcher remain enabled and active.
 
 The guard does not silently rewrite an upstream change. An incompatible state produces a deduplicated ntfy warning and causes the automatic check to fail closed. When compatibility is restored, one recovery notification is sent. A changed upstream `update.sh` or `tag-filter.sh` that passes all checks produces one informational ntfy notification confirming that the new interface state was validated.
@@ -64,7 +64,7 @@ The guard does not silently rewrite an upstream change. An incompatible state pr
 
 - Proxmox VE host with Ultimate Updater installed under `/etc/ultimate-updater`;
 - Bash;
-- `curl`, `sha256sum`, `python3`, `pct`, and `qm`;
+- `curl`, GNU `timeout`, `sha256sum`, `python3`, `pct`, and `qm`;
 - an ntfy topic and access token;
 - for SSH VMs, working key-based SSH and the non-interactive APT metadata-refresh permission described above.
 
@@ -82,7 +82,7 @@ The installer:
 2. installs the systemd service, timer, and path units;
 3. creates `/etc/proxmox-ultimate-updater-notify/config` only if it does not already exist;
 4. preserves operator configuration on reinstall;
-5. removes matching Ultimate Updater check entries from root's crontab while preserving their exact original lines for uninstall;
+5. removes matching Ultimate Updater check entries from root's user crontab, `/etc/crontab`, and `/etc/cron.d` while preserving exact original source lines for uninstall;
 6. enables the 07:00/19:00 timer and manual-log path watcher.
 
 The installer does not create or guess an ntfy token.
@@ -112,6 +112,21 @@ sudoedit /etc/proxmox-ultimate-updater-notify/ntfy-token
 ```
 
 The notifier publishes directly to ntfy over HTTP(S) and authenticates with native ntfy access-token authentication (`Authorization: Bearer <token>`). Apprise is not required at runtime; its ntfy token mode uses the same upstream authentication model. The bearer token is supplied to curl through standard input as a header file, so it is not placed in curl's process arguments.
+
+## Optional Gatus dead-man heartbeat
+
+Systemd-scheduled successful checks can publish a heartbeat to a Gatus external endpoint. This remains optional so the public companion has no Gatus runtime dependency. Configure both values to enable it:
+
+```bash
+GATUS_HEARTBEAT_URL="https://gatus.example.com/api/v1/endpoints/group_name/external"
+GATUS_HEARTBEAT_TOKEN_FILE="/etc/proxmox-ultimate-updater-notify/gatus-heartbeat-token"
+```
+
+Only the packaged systemd check service marks runs as scheduled. A direct operator invocation of `proxmox-ultimate-updater-notify check` does not advance the heartbeat. The Gatus Bearer token is read from a file and, like the ntfy token, supplied to curl through header stdin rather than process arguments. If Gatus does not acknowledge a scheduled heartbeat, the check fails and the normal ntfy failure path reports the delivery problem.
+
+## Runtime bounds
+
+Potentially blocking APT, LXC, SSH, and QEMU guest operations are bounded to 120 seconds per command. Outbound ntfy and Gatus HTTP calls use a 10-second connect timeout and a 30-second total timeout. The systemd automatic-check service has a 10-minute final runtime cap.
 
 Use an `https://` ntfy topic URL whenever the publisher crosses an untrusted network boundary. The token file should contain only the ntfy access token and remain readable only by the privileged service account.
 
@@ -145,7 +160,7 @@ Continue to run Ultimate Updater manually as usual when you decide to install up
 sudo bash install.sh uninstall
 ```
 
-Uninstall disables and removes the notifier units and executable, restores the exact saved Ultimate Updater root-crontab check lines when they are not already present, and deliberately preserves `/etc/proxmox-ultimate-updater-notify` so operator configuration and the ntfy token are not destroyed.
+Uninstall disables and removes the notifier units and executable, restores the exact saved Ultimate Updater check lines to their original root-user or system-wide cron source when they are not already present, and deliberately preserves `/etc/proxmox-ultimate-updater-notify` so operator configuration and token files are not destroyed.
 
 ## Development
 

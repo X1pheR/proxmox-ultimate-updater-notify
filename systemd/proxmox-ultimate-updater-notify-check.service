@@ -5,4 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+Environment=PUUN_SCHEDULED_RUN=true
+TimeoutStartSec=10min
 ExecStart=/usr/local/libexec/proxmox-ultimate-updater-notify check

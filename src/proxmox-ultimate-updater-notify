@@ -10,6 +10,10 @@ UPDATER_LOG="${PUUN_UPDATER_LOG:-/var/log/ultimate-updater.log}"
 UPDATER_ENTRYPOINT="${PUUN_UPDATER_ENTRYPOINT:-${UPDATER_DIR}/update.sh}"
 SYSTEMCTL="${PUUN_SYSTEMCTL:-systemctl}"
 CRONTAB="${PUUN_CRONTAB:-crontab}"
+SYSTEM_CRONTAB="${PUUN_SYSTEM_CRONTAB:-/etc/crontab}"
+CRON_D_DIR="${PUUN_CRON_D_DIR:-/etc/cron.d}"
+TIMEOUT_BIN="${PUUN_TIMEOUT:-timeout}"
+COMMAND_TIMEOUT_SECONDS="${PUUN_COMMAND_TIMEOUT_SECONDS:-120}"
 MANUAL_DEDUPE_SECONDS="${PUUN_MANUAL_DEDUPE_SECONDS:-90}"
 
 log() {
@@ -41,6 +45,10 @@ load_config() {
 
   [[ -r "$NTFY_TOKEN_FILE" ]] || die "ntfy token file is not readable: $NTFY_TOKEN_FILE"
   require_command curl
+}
+
+run_bounded() {
+  "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${COMMAND_TIMEOUT_SECONDS}s" "$@"
 }
 
 ensure_state_dir() {
@@ -82,9 +90,35 @@ send_ntfy() {
     --fail \
     --silent \
     --show-error \
+    --connect-timeout 10 \
+    --max-time 30 \
     --header @- \
     --data-binary "$message" \
     "$NTFY_URL" >/dev/null
+}
+
+send_gatus_heartbeat() {
+  local token
+
+  [[ "${PUUN_SCHEDULED_RUN:-false}" == "true" ]] || return 0
+  load_config
+  GATUS_HEARTBEAT_URL="${GATUS_HEARTBEAT_URL:-}"
+  GATUS_HEARTBEAT_TOKEN_FILE="${GATUS_HEARTBEAT_TOKEN_FILE:-}"
+  [[ -n "$GATUS_HEARTBEAT_URL" ]] || return 0
+  [[ -n "$GATUS_HEARTBEAT_TOKEN_FILE" ]] || die "GATUS_HEARTBEAT_TOKEN_FILE must be configured when GATUS_HEARTBEAT_URL is set"
+  [[ -r "$GATUS_HEARTBEAT_TOKEN_FILE" ]] || die "Gatus heartbeat token file is not readable: $GATUS_HEARTBEAT_TOKEN_FILE"
+  token=$(<"$GATUS_HEARTBEAT_TOKEN_FILE")
+  [[ -n "$token" ]] || die "Gatus heartbeat token file is empty"
+
+  printf 'Authorization: Bearer %s\n' "$token" | curl \
+    --fail \
+    --silent \
+    --show-error \
+    --connect-timeout 10 \
+    --max-time 30 \
+    --header @- \
+    --request POST \
+    "${GATUS_HEARTBEAT_URL}?success=true" >/dev/null
 }
 
 sanitize_text() {
@@ -100,6 +134,29 @@ is_updater_check_cron() {
   [[ "$line" =~ (^|[[:space:]])(/usr/local/sbin/)?update[[:space:]]+-check([[:space:]]|$) ]] ||
     [[ "$line" =~ (^|[[:space:]])/etc/ultimate-updater/update\.sh[[:space:]]+-check([[:space:]]|$) ]] ||
     [[ "$line" =~ (^|[[:space:]])/etc/ultimate-updater/check-updates\.sh([[:space:]]|$) ]]
+}
+
+validate_cron_file() {
+  local source=$1
+  local line
+
+  [[ -r "$source" ]] || die "cron source is not readable: $source"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if is_updater_check_cron "$line"; then
+      die "Ultimate Updater automatic check cron is present in $source; companion scheduling must remain the only automatic check path"
+    fi
+  done <"$source"
+}
+
+validate_system_cron_sources() {
+  local cron_file
+
+  validate_cron_file "$SYSTEM_CRONTAB"
+  [[ -d "$CRON_D_DIR" ]] || return 0
+  for cron_file in "$CRON_D_DIR"/*; do
+    [[ -f "$cron_file" ]] || continue
+    validate_cron_file "$cron_file"
+  done
 }
 
 read_updater_version() {
@@ -164,6 +221,7 @@ compatibility_probe() {
       die "Ultimate Updater automatic check cron is present; companion scheduling must remain the only automatic check path"
     fi
   done < <("$CRONTAB" -l 2>/dev/null || true)
+  validate_system_cron_sources || return 1
 
   fingerprint=$(upstream_fingerprint)
   printf '%s|%s\n' "$version" "$fingerprint"
@@ -341,8 +399,8 @@ check_host() {
 
   require_command apt-get
   name=$(hostname -s)
-  DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null
-  apt_output=$(LC_ALL=C apt-get -s upgrade)
+  run_bounded env DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null
+  apt_output=$(run_bounded env LC_ALL=C apt-get -s upgrade)
   [[ -f /var/run/reboot-required.pkgs ]] && reboot=yes
   append_apt_result host host "$name" "$reboot" "$apt_output"
 }
@@ -366,9 +424,9 @@ check_lxc() {
     *) die "LXC $id uses unsupported automatic-check OS family: ${ostype:-unknown}" ;;
   esac
 
-  name=$(pct exec "$id" -- hostname 2>/dev/null || printf 'lxc-%s' "$id")
-  apt_output=$(pct exec "$id" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
-  if pct exec "$id" -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
+  name=$(run_bounded pct exec "$id" -- hostname 2>/dev/null || printf 'lxc-%s' "$id")
+  apt_output=$(run_bounded pct exec "$id" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
+  if run_bounded pct exec "$id" -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
     reboot=yes
   fi
   append_apt_result lxc "$id" "$name" "$reboot" "$apt_output"
@@ -398,10 +456,10 @@ check_vm_ssh() {
   port=${port:-22}
   [[ -n "$ip" ]] || die "VM $id SSH configuration has no IP"
 
-  if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" true >/dev/null 2>&1; then
+  if ! run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" true >/dev/null 2>&1; then
     die "VM $id SSH connection failed"
   fi
-  if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'command -v apt-get >/dev/null 2>&1'; then
+  if ! run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'command -v apt-get >/dev/null 2>&1'; then
     die "VM $id uses an unsupported automatic-check package manager"
   fi
 
@@ -411,15 +469,15 @@ check_vm_ssh() {
     refresh_cmd='sudo -n /usr/bin/apt-get update -y >/dev/null'
   fi
 
-  if ! ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" "$refresh_cmd"; then
+  if ! run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" "$refresh_cmd"; then
     if [[ "$user" == "root" ]]; then
       die "VM $id package metadata refresh failed"
     fi
     die "VM $id package metadata refresh failed: non-root SSH user requires passwordless sudo for /usr/bin/apt-get update -y"
   fi
 
-  apt_output=$(ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" 'LC_ALL=C apt-get -s upgrade')
-  if ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'test -f /var/run/reboot-required.pkgs'; then
+  apt_output=$(run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" 'LC_ALL=C apt-get -s upgrade')
+  if run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'test -f /var/run/reboot-required.pkgs'; then
     reboot=yes
   fi
   name=$(qm config "$id" | awk '/^name:/ {print $2; exit}')
@@ -445,12 +503,12 @@ check_vm_qemu() {
     die "VM $id is $status; automatic checks never start, resume, stop, suspend, or reboot guests"
   fi
 
-  probe=$(qm guest exec "$id" --timeout 10 -- sh -c 'command -v apt-get >/dev/null 2>&1 && printf apt' 2>/dev/null | qemu_guest_stdout || true)
+  probe=$(run_bounded qm guest exec "$id" --timeout "$COMMAND_TIMEOUT_SECONDS" -- sh -c 'command -v apt-get >/dev/null 2>&1 && printf apt' 2>/dev/null | qemu_guest_stdout || true)
   [[ "$probe" == "apt" ]] || die "VM $id uses an unsupported automatic-check package manager or QEMU guest agent is unavailable"
 
-  result=$(qm guest exec "$id" --timeout 0 -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
+  result=$(run_bounded qm guest exec "$id" --timeout "$COMMAND_TIMEOUT_SECONDS" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
   apt_output=$(printf '%s' "$result" | qemu_guest_stdout)
-  if qm guest exec "$id" --timeout 10 -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
+  if run_bounded qm guest exec "$id" --timeout "$COMMAND_TIMEOUT_SECONDS" -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
     reboot=yes
   fi
   name=$(qm config "$id" | awk '/^name:/ {print $2; exit}')
@@ -481,6 +539,7 @@ collect_updates() {
 
   [[ -r "$UPDATER_CONFIG" ]] || die "Ultimate Updater configuration is not readable: $UPDATER_CONFIG"
   require_command sha256sum
+  require_command "$TIMEOUT_BIN"
   require_command pct
   require_command qm
   require_command python3
@@ -553,20 +612,35 @@ process_check_success() {
   if [[ -n "$normalized" ]]; then
     current_hash=$(printf '%s\n' "$normalized" | hash_text)
     if [[ "$previous_status" == "failure" ]]; then
-      send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again."
+      if ! send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again."; then
+        log "failed to send ntfy recovery notification"
+        return 1
+      fi
     fi
     if [[ "$previous_status" != "updates" ]]; then
-      send_ntfy "Updates available" "package" "$(format_update_message "$normalized")"
+      if ! send_ntfy "Updates available" "package" "$(format_update_message "$normalized")"; then
+        log "failed to send ntfy updates-available notification"
+        return 1
+      fi
     elif [[ "$previous_hash" != "$current_hash" ]]; then
-      send_ntfy "Available updates changed" "package" "$(format_update_message "$normalized")"
+      if ! send_ntfy "Available updates changed" "package" "$(format_update_message "$normalized")"; then
+        log "failed to send ntfy changed-updates notification"
+        return 1
+      fi
     fi
     atomic_write "${STATE_DIR}/check-status" "updates"
     atomic_write "${STATE_DIR}/check-hash" "$current_hash"
   else
     if [[ "$previous_status" == "failure" ]]; then
-      send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again. No updates or reboot-required states are currently reported."
+      if ! send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again. No updates or reboot-required states are currently reported."; then
+        log "failed to send ntfy recovery notification"
+        return 1
+      fi
     elif [[ "$previous_status" == "updates" ]]; then
-      send_ntfy "Updates cleared" "white_check_mark" "Previously reported package updates or reboot-required states are no longer present."
+      if ! send_ntfy "Updates cleared" "white_check_mark" "Previously reported package updates or reboot-required states are no longer present."; then
+        log "failed to send ntfy updates-cleared notification"
+        return 1
+      fi
     fi
     atomic_write "${STATE_DIR}/check-status" "clear"
     atomic_write "${STATE_DIR}/check-hash" ""
@@ -625,7 +699,16 @@ run_check() {
 
   normalized=$(cat "$output_file")
   rm -f "$output_file" "$error_file"
-  process_check_success "$normalized"
+  if ! process_check_success "$normalized"; then
+    return 1
+  fi
+  local heartbeat_error
+  if ! heartbeat_error=$(send_gatus_heartbeat 2>&1); then
+    if ! process_check_failure "Gatus heartbeat delivery failed${heartbeat_error:+: $heartbeat_error}"; then
+      return 1
+    fi
+    return 1
+  fi
 }
 
 manual_run_marker_present() {
