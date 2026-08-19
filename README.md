@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/X1pheR/proxmox-ultimate-updater-notify/actions/workflows/ci.yml/badge.svg)](https://github.com/X1pheR/proxmox-ultimate-updater-notify/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/X1pheR/proxmox-ultimate-updater-notify)](https://github.com/X1pheR/proxmox-ultimate-updater-notify/releases/latest)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/X1pheR/proxmox-ultimate-updater-notify/badge)](https://scorecard.dev/viewer/?uri=github.com/X1pheR/proxmox-ultimate-updater-notify)
 [![License: MIT](https://img.shields.io/github/license/X1pheR/proxmox-ultimate-updater-notify)](LICENSE)
 
 `proxmox-ultimate-updater-notify` is a community-maintained notification companion for [BassT23/Proxmox Ultimate Updater](https://github.com/BassT23/Proxmox). It adds safe scheduled update checks, deduplicated ntfy notifications, manual-run completion notifications, upstream compatibility health checks, and an optional Gatus dead-man heartbeat.
@@ -93,13 +94,21 @@ Run the behavior suite with:
 bash tests/run.sh
 ```
 
-CI also runs Bash syntax checks, ShellCheck, the behavior suite, and systemd unit verification.
+CI also runs Bash syntax checks, ShellCheck, the behavior suite, and systemd unit verification. Dependabot tracks GitHub Actions updates, external Actions are pinned to full commit SHAs, and OpenSSF Scorecard publishes an independent repository-security signal.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements and [CHANGELOG.md](CHANGELOG.md) for user-visible release changes.
+
+## Release model
+
+The current immutable release is `v0.3.1`. Normal development does not publish releases. An accepted strict SemVer tag must resolve to the exact version in `VERSION` and an accepted source commit; guarded recovery may reuse an existing draft for that exact tag, but the workflow refuses to mutate an already published immutable release.
+
+Release automation re-runs syntax, ShellCheck, behavior and systemd validation, builds the source archive from the exact accepted commit, writes `SHA256SUMS`, generates signed GitHub/Sigstore provenance for the archive, and only then publishes the GitHub Release.
 
 ## Security
 
 No production credentials belong in this repository. Keep ntfy and Gatus tokens in root-readable token files, not in Git or command-line arguments.
 
-Security-sensitive issues should be reported through GitHub Private Vulnerability Reporting for this repository. Use normal GitHub Issues only for non-sensitive bugs, questions, and discussions that do not contain credentials, tokens, private hostnames, exploit details, or other sensitive environment information.
+Security-sensitive issues should be reported through [GitHub Private Vulnerability Reporting](https://github.com/X1pheR/proxmox-ultimate-updater-notify/security/advisories/new). See [SECURITY.md](SECURITY.md) for the supported-version and security boundary. Use normal GitHub Issues only for non-sensitive bugs, questions, and discussions that do not contain credentials, tokens, private hostnames, exploit details, or other sensitive environment information.
 
 ## License and upstream relationship
 
