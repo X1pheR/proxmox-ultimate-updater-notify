@@ -64,6 +64,7 @@ EOF
   : >"$FIXTURE/curl-args"
   : >"$FIXTURE/curl-stdin"
   : >"$FIXTURE/curl-count"
+  : >"$FIXTURE/curl-body"
   : >"$FIXTURE/ssh-log"
   : >"$FIXTURE/timeout-log"
 
@@ -72,6 +73,16 @@ EOF
 printf '%s\n' "$*" >>"$TEST_FIXTURE/curl-args"
 cat >>"$TEST_FIXTURE/curl-stdin"
 printf '1\n' >>"$TEST_FIXTURE/curl-count"
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "--data-binary" ]] && ((i + 1 < ${#args[@]})); then
+    printf '%s' "${args[$((i + 1))]}" >"$TEST_FIXTURE/curl-body"
+    if [[ "${TEST_NTFY_ENFORCE_MESSAGE_LIMIT:-false}" == "true" ]] && (( $(wc -c <"$TEST_FIXTURE/curl-body") > 4096 )); then
+      exit 22
+    fi
+    break
+  fi
+done
 if [[ "${TEST_CURL_FAIL:-false}" == "true" ]]; then
   exit 22
 fi
@@ -174,7 +185,7 @@ EOF
 
 cleanup_fixture() {
   rm -rf "$FIXTURE"
-  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_REBOOT_REQUIRED TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
+  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_NTFY_ENFORCE_MESSAGE_LIMIT TEST_REBOOT_REQUIRED TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
 }
 
 count_curl() {
@@ -401,6 +412,49 @@ bash "$APP" observe-manual
 assert "manual success notifies once across log-cleanup path events" test "$(count_curl)" -eq 1
 assert "ntfy token is absent from curl argv" not_grep_fixed "secret-test-token" "$FIXTURE/curl-args"
 assert "ntfy token is delivered through curl stdin" grep -Fq "Authorization: Bearer secret-test-token" "$FIXTURE/curl-stdin"
+cleanup_fixture
+
+# Large manual logs must not trigger pipefail/broken-pipe behavior and ntfy bodies must stay below its 4 KiB default.
+new_fixture
+{
+  for i in $(seq 1 900); do printf 'ordinary updater detail %04d: package metadata refreshed\n' "$i"; done
+  printf 'Updating Host : 192.0.2.1 | (pve)\n'
+  printf '%028200d\n' 0
+  for i in $(seq 1 10); do printf 'post-target detail %02d\n' "$i"; done
+  printf 'Updating VM 101 : docker\n'
+  printf 'Finished, all updates done.\n'
+} >"$FIXTURE/ultimate-updater.log"
+export TEST_NTFY_ENFORCE_MESSAGE_LIMIT=true
+set +e
+bash "$APP" observe-manual >/dev/null 2>&1
+large_manual_rc=$?
+set -e
+assert "large manual log completes without broken-pipe or ntfy-size failure" test "$large_manual_rc" -eq 0
+assert "large manual run emits exactly one notification" test "$(count_curl)" -eq 1
+assert "manual notification body remains below ntfy default limit" test "$(wc -c <"$FIXTURE/curl-body")" -le 4096
+assert "manual notification keeps host target summary" grep -Fq 'Updating Host : 192.0.2.1 | (pve)' "$FIXTURE/curl-body"
+assert "manual notification keeps VM target summary" grep -Fq 'Updating VM 101 : docker' "$FIXTURE/curl-body"
+assert "manual target heading uses a real newline" not_grep_fixed 'Targets:\n' "$FIXTURE/curl-body"
+assert "manual notification excludes oversized arbitrary detail" not_grep_fixed '0000000000000000000000000000' "$FIXTURE/curl-body"
+cleanup_fixture
+
+# Failed manual ntfy delivery must not persist dedupe state and must retry after recovery.
+new_fixture
+cat >"$FIXTURE/ultimate-updater.log" <<'EOF'
+Updating Host : 192.0.2.1 | (pve)
+Finished, all updates done.
+EOF
+export TEST_NTFY_FAIL=true
+set +e
+bash "$APP" observe-manual >/dev/null 2>&1
+manual_notify_fail_rc=$?
+set -e
+assert "failed manual ntfy delivery keeps observer non-zero" test "$manual_notify_fail_rc" -ne 0
+assert "failed manual ntfy delivery does not persist signature" test ! -e "$FIXTURE/state/manual-signature"
+unset TEST_NTFY_FAIL
+bash "$APP" observe-manual >/dev/null 2>&1
+assert "manual notification retries after delivery recovers" test "$(count_curl)" -eq 2
+assert "successful manual notification persists signature" test -s "$FIXTURE/state/manual-signature"
 cleanup_fixture
 
 # Manual 'Finished, with errors' must be failure even when upstream exits zero.
