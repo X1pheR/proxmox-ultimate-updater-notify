@@ -15,6 +15,7 @@ CRON_D_DIR="${PUUN_CRON_D_DIR:-/etc/cron.d}"
 TIMEOUT_BIN="${PUUN_TIMEOUT:-timeout}"
 COMMAND_TIMEOUT_SECONDS="${PUUN_COMMAND_TIMEOUT_SECONDS:-120}"
 MANUAL_DEDUPE_SECONDS="${PUUN_MANUAL_DEDUPE_SECONDS:-90}"
+NTFY_MESSAGE_MAX_BYTES="${PUUN_NTFY_MESSAGE_MAX_BYTES:-3500}"
 
 log() {
   printf '%s: %s\n' "$APP_NAME" "$*" >&2
@@ -71,6 +72,45 @@ state_read() {
   cat "$path"
 }
 
+limit_ntfy_message() {
+  local message=$1
+  local max_bytes=$NTFY_MESSAGE_MAX_BYTES
+  local suffix=$'\n\n[message truncated]'
+  local output=""
+  local line
+  local candidate
+  local bytes
+
+  [[ "$max_bytes" =~ ^[0-9]+$ ]] || die "PUUN_NTFY_MESSAGE_MAX_BYTES must be an integer"
+  ((max_bytes >= 256 && max_bytes <= 4096)) || die "PUUN_NTFY_MESSAGE_MAX_BYTES must be between 256 and 4096"
+
+  bytes=$(printf '%s' "$message" | wc -c)
+  if ((bytes <= max_bytes)); then
+    printf '%s' "$message"
+    return 0
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -n "$output" ]]; then
+      candidate="${output}"$'\n'"${line}"
+    else
+      candidate=$line
+    fi
+    bytes=$(printf '%s' "${candidate}${suffix}" | wc -c)
+    if ((bytes > max_bytes)); then
+      break
+    fi
+    output=$candidate
+  done <<<"$message"
+
+  if [[ -z "$output" ]]; then
+    output="[message content omitted because the first line exceeds the delivery limit]"
+  else
+    output+="$suffix"
+  fi
+  printf '%s' "$output"
+}
+
 send_ntfy() {
   local title=$1
   local tags=$2
@@ -81,6 +121,7 @@ send_ntfy() {
   load_config
   token=$(<"$NTFY_TOKEN_FILE")
   [[ -n "$token" ]] || die "ntfy token file is empty"
+  message=$(limit_ntfy_message "$message")
 
   # Keep the bearer token out of argv. curl reads all headers from stdin.
   {
@@ -784,15 +825,30 @@ run_check() {
 }
 
 manual_run_marker_present() {
-  grep -Eq 'Updating Host|Update only LXC/VM|--- PVE UPDATE ---|Updating LXC|Updating VM'
+  local clean_log=$1
+  grep -Eq 'Updating Host|Update only LXC/VM|--- PVE UPDATE ---|Updating LXC|Updating VM' <<<"$clean_log"
+}
+
+manual_target_details() {
+  local clean_log=$1
+  grep -E 'Updating Host|Update only LXC/VM|--- PVE UPDATE ---|Updating LXC|Updating VM' <<<"$clean_log" | awk '!seen[$0]++'
 }
 
 manual_failure_details() {
   local error_log
+  local line
+  local line_bytes
   error_log=$(read_updater_value ERROR_LOG_FILE || true)
   if [[ -n "$error_log" && -r "$error_log" && -s "$error_log" ]]; then
     printf '\n\nRecent Ultimate Updater error details:\n'
-    tail -30 "$error_log" | sanitize_text
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line_bytes=$(printf '%s' "$line" | wc -c)
+      if ((line_bytes > 512)); then
+        printf '[oversized error detail omitted: %d bytes]\n' "$line_bytes"
+      else
+        printf '%s\n' "$line"
+      fi
+    done < <(tail -30 "$error_log" | sanitize_text)
   fi
 }
 
@@ -811,7 +867,7 @@ observe_manual() {
   ensure_state_dir
   clean_log=$(sanitize_text <"$UPDATER_LOG")
 
-  if ! printf '%s\n' "$clean_log" | manual_run_marker_present; then
+  if ! manual_run_marker_present "$clean_log"; then
     return 0
   fi
 
@@ -831,7 +887,13 @@ observe_manual() {
     return 0
   fi
 
-  details=$(printf '%s\n' "$clean_log" | tail -40)
+  details=$(manual_target_details "$clean_log")
+  if [[ -n "$details" ]]; then
+    details="Targets:
+${details}"
+  else
+    details="Targets: unavailable"
+  fi
   if [[ "$outcome" != "success" ]]; then
     details+=$(manual_failure_details)
   fi

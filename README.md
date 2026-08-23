@@ -100,7 +100,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements and [CHANGE
 
 ## Release model
 
-The current immutable release is `v0.3.1`. Normal development does not publish releases. An accepted strict SemVer tag must resolve to the exact version in `VERSION` and an accepted source commit; guarded recovery may reuse an existing draft for that exact tag, but the workflow refuses to mutate an already published immutable release.
+The current immutable release is `v0.3.2`. Normal development does not publish releases. An accepted strict SemVer tag must resolve to the exact version in `VERSION` and an accepted source commit; guarded recovery may reuse an existing draft for that exact tag, but the workflow refuses to mutate an already published immutable release.
 
 Release automation re-runs syntax, ShellCheck, behavior and systemd validation, builds the source archive from the exact accepted commit, writes `SHA256SUMS`, generates signed GitHub/Sigstore provenance for the archive, and only then publishes the GitHub Release.
 
