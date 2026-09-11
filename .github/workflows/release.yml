@@ -61,7 +61,7 @@ jobs:
           bash -n install.sh src/proxmox-ultimate-updater-notify tests/run.sh
           shellcheck install.sh src/proxmox-ultimate-updater-notify tests/run.sh
           bash tests/run.sh
-          sudo install -m 0755 src/proxmox-ultimate-updater-notify /usr/local/libexec/proxmox-ultimate-updater-notify
+          sudo install -D -m 0755 src/proxmox-ultimate-updater-notify /usr/local/libexec/proxmox-ultimate-updater-notify
           systemd-analyze verify systemd/*.service systemd/*.timer systemd/*.path
 
       - name: Build source archive and checksum
