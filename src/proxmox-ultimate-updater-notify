@@ -237,8 +237,13 @@ validate_upstream_check_interface() {
   grep -Fq 'reboot_required' "$UPDATER_STATUS_MODEL" || die "Ultimate Updater status model no longer exposes reboot state"
   if ! (
     set +u
+    # These names are consumed by the dynamically sourced Ultimate Updater
+    # status model; ShellCheck cannot see those indirect references.
+    # shellcheck disable=SC2034
     LOCAL_FILES="$UPDATER_DIR"
+    # shellcheck disable=SC2034
     STATUS_MODEL_FILE="$UPDATER_STATUS_FILE"
+    # shellcheck disable=SC1090
     . "$UPDATER_STATUS_MODEL"
     declare -F STATUS_MODEL_RENDER_NOTIFICATION >/dev/null 2>&1
   ); then
@@ -264,7 +269,11 @@ validate_tag_helper() (
 
   [[ -r "$UPDATER_CONFIG" ]] || die "Ultimate Updater configuration is not readable: $UPDATER_CONFIG"
   [[ -r "${UPDATER_DIR}/tag-filter.sh" ]] || die "Ultimate Updater tag-filter.sh is not readable"
+  # The sourced upstream helper resolves these variables indirectly from the
+  # variable names passed to apply_only_exclude_tags.
+  # shellcheck disable=SC2034
   ONLY=$(read_updater_value ONLY_UPDATE_CHECK || true)
+  # shellcheck disable=SC2034
   EXCLUDED=$(read_updater_value EXCLUDE_UPDATE_CHECK || true)
 
   # Upstream's helper is not guaranteed to be nounset-safe. Keep the relaxed
@@ -395,8 +404,13 @@ run_health() {
 
 render_upstream_status() (
   set +u
+  # These names are consumed by the dynamically sourced Ultimate Updater
+  # status model; ShellCheck cannot see those indirect references.
+  # shellcheck disable=SC2034
   LOCAL_FILES="$UPDATER_DIR"
+  # shellcheck disable=SC2034
   STATUS_MODEL_FILE="$UPDATER_STATUS_FILE"
+  # shellcheck disable=SC1090
   . "$UPDATER_STATUS_MODEL"
   declare -F STATUS_MODEL_RENDER_NOTIFICATION >/dev/null 2>&1 || return 1
   STATUS_MODEL_RENDER_NOTIFICATION "$UPDATER_STATUS_FILE" check
