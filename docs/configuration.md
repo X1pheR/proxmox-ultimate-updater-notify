@@ -24,17 +24,9 @@ sudoedit /etc/proxmox-ultimate-updater-notify/ntfy-token
 
 The notifier uses native ntfy Bearer authentication. The token is piped to curl as a header file through standard input, so it is not placed in curl's process arguments. Apprise is not required at runtime.
 
-## SSH-managed VMs
+## Guest access
 
-Ultimate Updater may define a VM under `/etc/ultimate-updater/VMs/<vmid>`. When that VM is checked over SSH, key-based non-interactive access must work.
-
-For a non-root SSH user, the metadata refresh must already be permitted without a password:
-
-```text
-sudo -n /usr/bin/apt-get update -y
-```
-
-The notifier deliberately does not broaden sudoers. If that exact refresh cannot run non-interactively, the check fails.
+Guest access is owned by Ultimate Updater. If Ultimate Updater defines a VM under `/etc/ultimate-updater/VMs/<vmid>` and checks it over SSH, its normal key-based/non-interactive prerequisites must already work. The companion no longer opens its own SSH session or maintains a separate sudo/package-manager contract; it delegates the read-only inventory check to the accepted Ultimate Updater 5.1 interface.
 
 ## Optional Gatus dead-man heartbeat
 

@@ -13,9 +13,9 @@ This project is not affiliated with, endorsed by, or maintained by the Ultimate 
 
 ## What it adds
 
-- Scheduled APT-only update checks at 07:00 and 19:00 through systemd.
+- Scheduled update checks at 07:00 and 19:00 through systemd, delegated to Ultimate Updater 5.1's read-only `initial-inventory` status interface.
 - ntfy notifications when updates appear, change, clear, fail, or recover.
-- Mobile-friendly Markdown update lists with security markers and reboot-required callouts.
+- ntfy update messages that forward Ultimate Updater's native status rendering, including security/normal splits, totals, and reboot-required targets.
 - Notifications for completed operator-triggered Ultimate Updater runs.
 - Compatibility checks that fail closed when the upstream integration boundary changes unexpectedly.
 - Safe takeover and uninstall restoration of matching upstream automatic-check cron entries.
@@ -26,28 +26,29 @@ This project is not affiliated with, endorsed by, or maintained by the Ultimate 
 
 ![Synthetic ntfy update notification preview](docs/images/ntfy-update-notification.svg)
 
-*Privacy-safe synthetic example. Security updates are marked with a lock and reboot-required targets are called out explicitly.*
+*Privacy-safe synthetic example of the native Ultimate Updater status text forwarded through ntfy.*
 
 ## Safety model
 
 Automatic checks:
 
-- refresh APT metadata and simulate upgrades only;
-- never run `apt-get upgrade`, `dist-upgrade`, `full-upgrade`, or equivalent package-install commands;
-- never start, stop, resume, suspend, or reboot LXC/VM guests;
-- do not invoke the upstream `update -check` or `check-updates.sh` paths;
-- fail instead of falling back to an unsupported or potentially mutating check path.
+- invoke Ultimate Updater 5.1's `check-updates.sh` only with `UU_JOB_SOURCE=initial-inventory` and deferred upstream notifications;
+- consume Ultimate Updater's structured `status.json` and native `STATUS_MODEL_RENDER_NOTIFICATION` output instead of reimplementing package counts or reboot detection;
+- never invoke the normal upstream `update -check` path;
+- never install package updates;
+- never start, stop, resume, suspend, or reboot LXC/VM guests; stopped or paused selected targets remain `Not checked` issues;
+- fail closed when the accepted upstream safety-critical source boundary changes.
 
 See [Safety and compatibility](docs/safety-and-compatibility.md) for the complete boundary, supported targets, compatibility guard, cron lifecycle, and runtime limits.
 
 ## Requirements
 
-- Proxmox VE with Ultimate Updater installed under `/etc/ultimate-updater`;
-- Bash, `curl`, GNU `timeout`, `sha256sum`, `python3`, `pct`, and `qm`;
+- Proxmox VE with Ultimate Updater **5.1** installed under `/etc/ultimate-updater`;
+- Bash, `curl`, GNU `timeout`, `sha256sum`, and `python3`;
 - an ntfy topic and access token;
-- key-based SSH for SSH-managed VMs, when used.
+- any guest-access prerequisites already required by Ultimate Updater for the targets it checks.
 
-The current compatibility baseline targets Ultimate Updater 5.0 and Debian-family APT guests. See [Safety and compatibility](docs/safety-and-compatibility.md) for details.
+The current safety-critical compatibility baseline is exact Ultimate Updater 5.1. See [Safety and compatibility](docs/safety-and-compatibility.md) for details.
 
 ## Quick start
 
@@ -82,7 +83,7 @@ Continue to run Ultimate Updater manually as usual when you decide to install up
 
 ## Documentation
 
-- [Configuration](docs/configuration.md) — ntfy, secret files, SSH-managed VMs, and optional Gatus heartbeat.
+- [Configuration](docs/configuration.md) — ntfy, secret files, guest-access prerequisites, and optional Gatus heartbeat.
 - [Safety and compatibility](docs/safety-and-compatibility.md) — automatic-check boundary, supported targets, compatibility health, cron ownership, and runtime limits.
 - [Operations](docs/operations.md) — notification behavior, verification, systemd units, manual updates, and uninstall.
 
@@ -100,7 +101,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution requirements and [CHANGE
 
 ## Release model
 
-The current immutable release is `v0.3.2`. Normal development does not publish releases. An accepted strict SemVer tag must resolve to the exact version in `VERSION` and an accepted source commit; guarded recovery may reuse an existing draft for that exact tag, but the workflow refuses to mutate an already published immutable release.
+Normal development does not publish releases. An accepted strict SemVer tag must resolve to the exact version in `VERSION` and an accepted source commit; guarded recovery may reuse an existing draft for that exact tag, but the workflow refuses to mutate an already published immutable release.
 
 Release automation re-runs syntax, ShellCheck, behavior and systemd validation, builds the source archive from the exact accepted commit, writes `SHA256SUMS`, generates signed GitHub/Sigstore provenance for the archive, and only then publishes the GitHub Release.
 

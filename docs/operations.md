@@ -14,19 +14,18 @@ The notifier sends ntfy messages when:
 - Ultimate Updater reports `Finished, with errors.` even when its process exit status is zero;
 - upstream compatibility health fails or the failure changes;
 - compatibility health recovers;
-- upstream interface files change and the new state passes compatibility validation.
+- the accepted upstream safety boundary changes and compatibility health fails closed.
 
 Unchanged automatic and compatibility states are deduplicated. Multiple filesystem events from the same completed manual run are suppressed for a short window, while a later identical manual run can notify again.
 
-Update-availability and changed-update notifications use ntfy Markdown with:
+Update-availability and changed-update notifications forward Ultimate Updater's native plain-text `STATUS_MODEL_RENDER_NOTIFICATION` output. That keeps the ntfy message aligned with Ultimate Updater itself, including:
 
-- a target/update/security/reboot summary;
-- one heading per Proxmox host, LXC, or VM target;
-- package name and candidate version bullets;
-- a lock marker for security updates;
-- an explicit **Reboot required** callout for affected targets.
+- per-target `S:` (security) and `N:` (normal) update counts;
+- the total available-update count;
+- reboot-required targets;
+- native `Not checked`, unreachable, unsupported, and error sections when Ultimate Updater reports issues.
 
-Health, failure, recovery, and manual-run messages remain plain text so diagnostic output is not interpreted as Markdown.
+The companion owns delivery, deduplication, failure/recovery notifications, compatibility guarding, and the optional Gatus heartbeat; it no longer builds a second package-detail view. Health, failure, recovery, and manual-run messages also remain plain text.
 
 ## Verify the installation
 

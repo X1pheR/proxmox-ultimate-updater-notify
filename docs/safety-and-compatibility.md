@@ -8,30 +8,24 @@ The companion deliberately separates **checking** from **installing**.
 
 Automatic checks:
 
-- refresh APT package metadata;
-- simulate upgrades with `apt-get -s upgrade`;
-- report available package updates and reboot-required state;
+- invoke `/etc/ultimate-updater/check-updates.sh` only with `UU_JOB_SOURCE=initial-inventory`, `UU_DEFER_NOTIFICATION=true`, and bounded runtime;
+- let Ultimate Updater own target selection, package-manager checks, security/normal classification, total counts, and reboot detection;
+- consume Ultimate Updater's structured `status.json` and `STATUS_MODEL_RENDER_NOTIFICATION` output;
+- never invoke the normal upstream `update -check` path;
 - never install package updates;
-- never start, stop, resume, suspend, or reboot Proxmox guests;
-- never invoke upstream `update -check` or `/etc/ultimate-updater/check-updates.sh` automatically.
+- never start, stop, resume, suspend, or reboot Proxmox guests.
 
-Actual package installation remains operator-triggered through Ultimate Updater.
-
-The upstream automatic checker is intentionally excluded because some non-APT paths can execute package upgrades or temporarily change guest power state. The companion fails closed rather than falling back to those paths.
+Actual package installation remains operator-triggered through Ultimate Updater. The `initial-inventory` mode is the accepted upstream read-only lifecycle boundary: stopped or paused selected guests are left unchanged and represented as `Not checked`. The companion treats Ultimate Updater's native `STATE=issues` result as a failed scheduled check rather than silently advancing the success heartbeat.
 
 ## Compatibility baseline
 
-The initial supported baseline is intentionally narrow:
+The supported safety-critical baseline is intentionally narrow at the upstream-interface level:
 
-- Proxmox VE host running Ultimate Updater 5.0 with its current `/etc/ultimate-updater` layout;
-- Debian-family APT LXC targets: `debian`, `ubuntu`, and `devuan`;
-- APT-detected Linux VMs;
-- running guests only for automatic checks;
-- SSH-managed VMs or QEMU Guest Agent managed VMs.
+- Proxmox VE host running **Ultimate Updater 5.1** with its current `/etc/ultimate-updater` layout;
+- `initial-inventory` behavior and the structured status-model interface present in that release;
+- target and package-manager support inherited from the accepted Ultimate Updater 5.1 check/status model rather than duplicated by the companion.
 
-Stopped or paused guests selected for automatic checking are reported as unsafe conditions. They are not started or resumed to complete a check.
-
-Unsupported package-manager families and unavailable target access fail the check.
+Stopped or paused selected guests are not started or resumed. Ultimate Updater represents them as `Not checked`, which the companion surfaces as a failed check. Unreachable, unsupported, errored, or otherwise not-checked selected targets likewise remain visible through Ultimate Updater's native `STATE=issues` rendering.
 
 ## Upstream compatibility health
 
@@ -39,15 +33,14 @@ Before every automatic update check, the notifier validates the upstream integra
 
 The health check verifies that:
 
-- `/etc/ultimate-updater/update.sh` is readable and still exposes a version marker;
-- `tag-filter.sh` exists and still exposes a callable `apply_only_exclude_tags` interface;
+- Ultimate Updater reports exactly version `5.1`;
+- `update.sh`, `check-updates.sh`, `status-model.sh`, `target-runtime.sh`, and `tag-filter.sh` expose the accepted interfaces required by the delegated check path;
+- `STATUS_MODEL_RENDER_NOTIFICATION` remains callable;
 - Ultimate Updater's configured `LOG_FILE` still matches the manual observer path;
-- no upstream automatic `update -check` or `check-updates.sh` entry exists in root's user crontab, `/etc/crontab`, or `/etc/cron.d`;
+- no separate upstream automatic `update -check` or `check-updates.sh` cron entry exists in root's user crontab, `/etc/crontab`, or `/etc/cron.d`;
 - the companion check timer and manual path watcher remain enabled and active.
 
-A failed compatibility probe blocks the automatic package check and sends a deduplicated ntfy warning. Recovery sends one recovery notification. If the upstream interface files change but the new state remains compatible, one informational notification confirms that the changed interface was validated.
-
-The health path does **not** silently rewrite newly detected upstream drift.
+The first successful v0.4 compatibility check records a safety fingerprint across the five safety-critical upstream interface files. Any later source drift fails closed and blocks automatic checks until a new notifier release explicitly accepts the changed upstream boundary. A failed compatibility probe sends a deduplicated ntfy warning; restoration of the accepted boundary sends one recovery notification.
 
 ## Cron ownership and restoration
 
@@ -65,19 +58,17 @@ This makes the companion systemd timer the only intended automatic update-check 
 
 ## Runtime bounds
 
-Potentially blocking APT, LXC, SSH, and QEMU guest operations are bounded to 120 seconds per command.
+The delegated Ultimate Updater `initial-inventory` run is bounded to 540 seconds by the companion and the complete systemd automatic-check service remains capped at 10 minutes.
 
 Outbound ntfy and Gatus HTTP calls use:
 
 - 10-second connect timeout;
 - 30-second total timeout.
 
-The complete systemd automatic-check service has a 10-minute `TimeoutStartSec` cap.
-
 These limits are safety bounds, not expected normal runtimes.
 
 ## Upstream relationship
 
-The companion does not patch or redistribute Ultimate Updater source. It consumes only the small upstream interfaces required for target selection, configuration, version/log compatibility checks, and operator-run observation.
+The companion does not patch or redistribute Ultimate Updater source. It consumes Ultimate Updater 5.1's accepted read-only inventory/status interfaces plus the version/log/tag configuration needed for compatibility and operator-run observation.
 
 Ultimate Updater remains responsible for the behavior and authorization of manual update installation.
