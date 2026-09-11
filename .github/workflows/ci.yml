@@ -32,5 +32,5 @@ jobs:
 
       - name: Verify systemd units
         run: |
-          sudo install -m 0755 src/proxmox-ultimate-updater-notify /usr/local/libexec/proxmox-ultimate-updater-notify
+          sudo install -D -m 0755 src/proxmox-ultimate-updater-notify /usr/local/libexec/proxmox-ultimate-updater-notify
           systemd-analyze verify systemd/*.service systemd/*.timer systemd/*.path

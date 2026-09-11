@@ -50,8 +50,80 @@ apply_only_exclude_tags() { return 0; }
 EOF
   cat >"$FIXTURE/updater/update.sh" <<'EOF'
 #!/usr/bin/env bash
-VERSION="5.0"
+VERSION="5.1"
 EOF
+  cat >"$FIXTURE/updater/status-model.sh" <<'EOF'
+#!/usr/bin/env bash
+# Fixture interface markers expected by companion compatibility validation.
+STATUS_MODEL_FILE="${STATUS_MODEL_FILE:-status.json}"
+# normal_updates security_updates reboot_required
+STATUS_MODEL_RENDER_NOTIFICATION() {
+  python3 - "${1:-$STATUS_MODEL_FILE}" <<'PYJSON'
+import json
+import sys
+p=json.load(open(sys.argv[1], encoding="utf-8"))
+targets=[t for t in p.get("targets",[]) if isinstance(t,dict)]
+issues=[t for t in targets if t.get("check_status") in ("offline","error","unsupported","not_checked")]
+updates=[t for t in targets if isinstance((t.get("updates") or {}).get("available"),int) and ((t.get("updates") or {}).get("available")>0 or t.get("reboot_required") is True)]
+if issues:
+    state="issues"
+elif updates:
+    state="updates"
+elif targets:
+    state="current"
+else:
+    state="empty"
+print(f"STATE={state}")
+print("Ultimate Updater status")
+print("=======================")
+print()
+if updates:
+    print("Available updates:")
+    total=0
+    for t in updates:
+        available=(t.get("updates") or {}).get("available",0)
+        total += available
+        name=t.get("name") or t.get("node") or t.get("id")
+        print(f"{t.get('type')} {t.get('id')} · {name}")
+        print(f"S: {t.get('security_updates')} / N: {t.get('normal_updates')}")
+    print()
+    print(f"Total available updates: {total}")
+    reboots=[t for t in targets if t.get("reboot_required") is True]
+    if reboots:
+        print()
+        print("Reboot required:")
+        for t in reboots:
+            print(t.get("name") or t.get("node") or t.get("id"))
+elif state == "current":
+    print("Available updates: none")
+if issues:
+    print("Not checked:")
+    for t in issues:
+        print(t.get("name") or t.get("id"))
+PYJSON
+}
+EOF
+  cat >"$FIXTURE/updater/target-runtime.sh" <<'EOF'
+#!/usr/bin/env bash
+READ_APT_UPDATE_COUNTS() { :; }
+EOF
+  cat >"$FIXTURE/updater/check-updates.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+INITIAL_INVENTORY=false
+[[ "${UU_JOB_SOURCE:-}" == initial-inventory ]] && INITIAL_INVENTORY=true
+# UU_DEFER_NOTIFICATION is honored by the real upstream checker.
+HOST_KERNEL_REBOOT_REQUIRED () { :; }
+[[ "${UU_DEFER_NOTIFICATION:-false}" == true ]] || exit 91
+[[ "$INITIAL_INVENTORY" == true ]] || exit 92
+printf 'job=%s defer=%s status=%s\n' "${UU_JOB_SOURCE:-}" "${UU_DEFER_NOTIFICATION:-}" "${STATUS_MODEL_FILE:-}" >>"$TEST_FIXTURE/upstream-check-log"
+if [[ "${TEST_UPSTREAM_CHECK_FAIL:-false}" == true ]]; then
+  printf 'simulated Ultimate Updater inventory failure\n' >&2
+  exit 42
+fi
+cp "$TEST_FIXTURE/upstream-status.json" "$STATUS_MODEL_FILE"
+EOF
+  chmod +x "$FIXTURE/updater/check-updates.sh"
   : >"$FIXTURE/crontab"
   mkdir -p "$FIXTURE/cron.d"
   : >"$FIXTURE/system-crontab"
@@ -61,6 +133,32 @@ USER="ronald"
 SSH_VM_PORT="22"
 EOF
   printf 'Inst package-a [1.0] (1.1 stable [amd64])\n' >"$FIXTURE/apt-output"
+  cat >"$FIXTURE/upstream-status.json" <<'EOF'
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-11T12:00:00Z",
+  "targets": [
+    {
+      "id": "101",
+      "type": "vm",
+      "transport": "ssh",
+      "reachable": true,
+      "os": "Debian GNU/Linux",
+      "updater": "apt",
+      "updates": {"available": 1},
+      "normal_updates": 1,
+      "security_updates": 0,
+      "reboot_required": false,
+      "check_status": "updates_available",
+      "error": null,
+      "node": "pve",
+      "name": "docker",
+      "security_split_supported": true
+    }
+  ]
+}
+EOF
+  : >"$FIXTURE/upstream-check-log"
   : >"$FIXTURE/curl-args"
   : >"$FIXTURE/curl-stdin"
   : >"$FIXTURE/curl-count"
@@ -185,11 +283,34 @@ EOF
 
 cleanup_fixture() {
   rm -rf "$FIXTURE"
-  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_NTFY_ENFORCE_MESSAGE_LIMIT TEST_REBOOT_REQUIRED TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
+  unset TEST_FIXTURE TEST_REFRESH_FAIL TEST_UPSTREAM_CHECK_FAIL TEST_CURL_FAIL TEST_HEARTBEAT_FAIL TEST_NTFY_FAIL TEST_NTFY_ENFORCE_MESSAGE_LIMIT TEST_REBOOT_REQUIRED TEST_MANUAL_PATH_INACTIVE PUUN_SCHEDULED_RUN PUUN_CONFIG_FILE PUUN_STATE_DIR PUUN_UPDATER_DIR PUUN_UPDATER_CONFIG PUUN_UPDATER_LOG PUUN_CRONTAB PUUN_SYSTEMCTL PUUN_SYSTEM_CRONTAB PUUN_CRON_D_DIR
 }
 
 count_curl() {
   wc -l <"$FIXTURE/curl-count" | tr -d ' '
+}
+
+set_upstream_apt_status() {
+  local normal=$1 security=$2 reboot=$3
+  python3 - "$FIXTURE/upstream-status.json" "$normal" "$security" "$reboot" <<'PYJSON'
+import json
+import sys
+
+path, normal, security, reboot = sys.argv[1:]
+normal = int(normal)
+security = int(security)
+with open(path, encoding="utf-8") as source:
+    payload = json.load(source)
+target = payload["targets"][0]
+target["normal_updates"] = normal
+target["security_updates"] = security
+target["updates"]["available"] = normal + security
+target["reboot_required"] = reboot == "true"
+target["check_status"] = "updates_available" if normal + security or reboot == "true" else "ok"
+with open(path, "w", encoding="utf-8") as output:
+    json.dump(payload, output, indent=2)
+    output.write("\n")
+PYJSON
 }
 
 # Syntax and static safety.
@@ -315,19 +436,34 @@ assert "inactive manual path watcher fails compatibility health" test "$health_p
 assert "inactive manual path watcher is reported through ntfy" grep -Fq "manual.path" "$FIXTURE/curl-args"
 cleanup_fixture
 
-# Compatibility health: a healthy upstream change is reported once after validation.
+# Compatibility health: the accepted 5.1 safety boundary is baselined once and then immutable.
 new_fixture
 bash "$APP" health
-assert "initial healthy compatibility baseline is silent" test "$(count_curl)" -eq 0
+assert "initial healthy 5.1 compatibility baseline is silent" test "$(count_curl)" -eq 0
+assert "initial healthy 5.1 compatibility baseline stores safety fingerprint" test -s "$FIXTURE/state/upstream-safety-fingerprint"
+accepted_fingerprint=$(cat "$FIXTURE/state/upstream-safety-fingerprint" 2>/dev/null || printf missing)
+printf '\n# simulated upstream source drift\n' >>"$FIXTURE/updater/check-updates.sh"
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_drift_rc=$?
+set -e
+assert "safety-critical upstream source drift fails compatibility health" test "$health_drift_rc" -ne 0
+assert "safety-critical upstream source drift sends compatibility warning" grep -Fq "Compatibility check failed" "$FIXTURE/curl-stdin"
+assert "failed upstream drift does not replace accepted safety fingerprint" grep -Fqx "$accepted_fingerprint" "$FIXTURE/state/upstream-safety-fingerprint"
+cleanup_fixture
+
+# Compatibility health: unsupported Ultimate Updater versions fail closed.
+new_fixture
 cat >"$FIXTURE/updater/update.sh" <<'EOF'
 #!/usr/bin/env bash
-VERSION="5.1"
+VERSION="5.2"
 EOF
-bash "$APP" health
-assert "validated upstream change sends one ntfy notification" test "$(count_curl)" -eq 1
-assert "validated upstream change reports the version transition" grep -Fq "5.0 -> 5.1" "$FIXTURE/curl-args"
-bash "$APP" health
-assert "unchanged validated upstream state is deduplicated" test "$(count_curl)" -eq 1
+set +e
+bash "$APP" health >/dev/null 2>&1
+health_version_rc=$?
+set -e
+assert "unsupported Ultimate Updater version fails compatibility health" test "$health_version_rc" -ne 0
+assert "unsupported Ultimate Updater version is reported through ntfy" grep -Fq "5.2" "$FIXTURE/curl-args"
 cleanup_fixture
 
 # Compatibility health: a previously reported incompatibility sends one recovery notification.
@@ -537,50 +673,94 @@ assert "failed scheduled heartbeat persists check failure state" grep -Fqx "fail
 assert "failed scheduled heartbeat is reported through ntfy" grep -Fq "Gatus heartbeat delivery failed" "$FIXTURE/curl-args"
 cleanup_fixture
 
-# Potentially long-running target operations are bounded by GNU timeout.
+# The delegated upstream inventory run remains bounded by GNU timeout.
 new_fixture
 bash "$APP" check
-assert "automatic target operations use bounded command timeout" grep -Fq "120s ssh -q" "$FIXTURE/timeout-log"
+assert "Ultimate Updater inventory execution is bounded" grep -Fq "540s env UU_JOB_SOURCE=initial-inventory" "$FIXTURE/timeout-log"
 cleanup_fixture
 
-# Safe non-root SSH APT metadata refresh and update-state deduplication.
+# Update-state deduplication is driven by Ultimate Updater's structured status.
 new_fixture
 bash "$APP" check
-assert "non-root SSH metadata refresh matches existing Ultimate Updater sudo rule" grep -Fq "sudo -n /usr/bin/apt-get update -y" "$FIXTURE/ssh-log"
+assert "companion no longer performs direct guest SSH package collection" test ! -s "$FIXTURE/ssh-log"
 assert "first available-update state notifies" test "$(count_curl)" -eq 1
-assert "available-update notification enables ntfy Markdown" grep -Fq "Markdown: yes" "$FIXTURE/curl-stdin"
-assert "available-update notification uses a compact Markdown summary" grep -Fq '**1 target · 1 update · 0 security · no reboot**' "$FIXTURE/curl-args"
-assert "available-update notification groups packages under the target" grep -Fq '### VM 101 · docker' "$FIXTURE/curl-args"
-assert "available-update notification shows package and destination version" grep -Fq -- "- \`package-a\` → \`1.1\`" "$FIXTURE/curl-args"
+assert "native Ultimate Updater notification remains plain text" not_grep_fixed "Markdown: yes" "$FIXTURE/curl-stdin"
+assert "available-update notification forwards Ultimate Updater status heading" grep -Fq 'Ultimate Updater status' "$FIXTURE/curl-args"
+assert "available-update notification forwards target identity" grep -Fq 'vm 101 · docker' "$FIXTURE/curl-args"
+assert "available-update notification forwards Ultimate Updater split" grep -Fq 'S: 0 / N: 1' "$FIXTURE/curl-args"
+assert "available-update notification forwards Ultimate Updater total" grep -Fq 'Total available updates: 1' "$FIXTURE/curl-args"
 bash "$APP" check
 assert "unchanged update state is deduplicated" test "$(count_curl)" -eq 1
-printf 'Inst package-b [2.0] (2.1 stable [amd64])\n' >"$FIXTURE/apt-output"
+set_upstream_apt_status 2 0 false
 bash "$APP" check
 assert "changed update state notifies" test "$(count_curl)" -eq 2
-: >"$FIXTURE/apt-output"
+set_upstream_apt_status 0 0 false
 bash "$APP" check
 assert "cleared update state notifies" test "$(count_curl)" -eq 3
 cleanup_fixture
 
-# Security updates are visible in the compact Markdown notification.
+# Canonical Ultimate Updater status owns split counts and reboot state.
 new_fixture
-printf 'Inst libexpat1 [2.8.2-1~deb13u1] (2.8.3-1~deb13u1 Debian-Security:13/stable-security [amd64])\n' >"$FIXTURE/apt-output"
+set_upstream_apt_status 2 5 true
 bash "$APP" check
-assert "security update count is summarized" grep -Fq '**1 target · 1 update · 1 security · no reboot**' "$FIXTURE/curl-args"
-assert "security package is visually marked" grep -Fq -- "- 🔐 \`libexpat1\` → \`2.8.3-1~deb13u1\`" "$FIXTURE/curl-args"
+assert "automatic check delegates to Ultimate Updater initial-inventory mode" grep -Fq 'job=initial-inventory defer=true' "$FIXTURE/upstream-check-log"
+assert "Ultimate Updater normal/security split is preserved" grep -Fq 'S: 5 / N: 2' "$FIXTURE/curl-args"
+assert "Ultimate Updater total is preserved" grep -Fq 'Total available updates: 7' "$FIXTURE/curl-args"
+assert "Ultimate Updater reboot state is visibly called out" grep -Fq 'Reboot required:' "$FIXTURE/curl-args"
 cleanup_fixture
 
-# Reboot-required state remains explicit in the compact Markdown notification.
 new_fixture
-export TEST_REBOOT_REQUIRED=true
+set_upstream_apt_status 2 5 true
 bash "$APP" check
-assert "reboot-required target is summarized" grep -Fq '**1 target · 1 update · 0 security · 1 reboot required**' "$FIXTURE/curl-args"
-assert "reboot-required target is visibly called out" grep -Fq -- '- **Reboot required**' "$FIXTURE/curl-args"
+assert "ntfy forwards Ultimate Updater native status heading" grep -Fq 'Ultimate Updater status' "$FIXTURE/curl-args"
+assert "ntfy forwards Ultimate Updater native split line" grep -Fq 'S: 5 / N: 2' "$FIXTURE/curl-args"
+assert "ntfy forwards Ultimate Updater native total" grep -Fq 'Total available updates: 7' "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Security updates are rendered from Ultimate Updater's disjoint split.
+new_fixture
+set_upstream_apt_status 0 1 false
+bash "$APP" check
+assert "security update split is rendered by Ultimate Updater" grep -Fq 'S: 1 / N: 0' "$FIXTURE/curl-args"
+assert "security update total is rendered by Ultimate Updater" grep -Fq 'Total available updates: 1' "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Reboot-required state remains explicit even without a Debian marker in the companion.
+new_fixture
+set_upstream_apt_status 1 0 true
+bash "$APP" check
+assert "reboot-required target keeps its update split" grep -Fq 'S: 0 / N: 1' "$FIXTURE/curl-args"
+assert "reboot-required section is forwarded from Ultimate Updater" grep -Fq 'Reboot required:' "$FIXTURE/curl-args"
+assert "reboot-required target identity is forwarded" grep -Fq 'docker' "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Ultimate Updater targets that were selected but not checked remain visible as check issues.
+new_fixture
+python3 - "$FIXTURE/upstream-status.json" <<'PYJSON'
+import json,sys
+path=sys.argv[1]
+p=json.load(open(path))
+t=p["targets"][0]
+t["check_status"]="not_checked"
+t["reachable"]=False
+t["updates"]["available"]=None
+t["normal_updates"]=None
+t["security_updates"]=None
+t["reboot_required"]=None
+json.dump(p, open(path,"w"), indent=2)
+PYJSON
+set +e
+bash "$APP" check >/dev/null 2>&1
+not_checked_rc=$?
+set -e
+assert "selected target not checked keeps scheduled check non-zero" test "$not_checked_rc" -ne 0
+assert "selected target not checked is reported through native Ultimate Updater body" grep -Fq 'Not checked:' "$FIXTURE/curl-args"
+assert "selected target not checked persists failure state" grep -Fqx 'failure' "$FIXTURE/state/check-status"
 cleanup_fixture
 
 # Failed ntfy delivery must not poison failure dedupe state.
 new_fixture
-export TEST_REFRESH_FAIL=true
+export TEST_UPSTREAM_CHECK_FAIL=true
 export TEST_CURL_FAIL=true
 set +e
 bash "$APP" check
@@ -596,9 +776,9 @@ bash "$APP" check
 second_rc=$?
 set -e
 assert "same check failure retries after ntfy recovers" test "$retry_rc" -ne 0
-assert "repeated metadata refresh failure remains non-zero" test "$second_rc" -ne 0
+assert "repeated Ultimate Updater inventory failure remains non-zero" test "$second_rc" -ne 0
 assert "delivered identical check failure is then deduplicated" test "$(count_curl)" -eq 2
-unset TEST_REFRESH_FAIL
+unset TEST_UPSTREAM_CHECK_FAIL
 bash "$APP" check
 assert "recovered check state notifies" test "$(count_curl)" -eq 4
 # Recovery from failure with available updates sends recovery + available state.
@@ -652,12 +832,13 @@ STATE_PATH="$INSTALL_FIXTURE/root/var/lib/proxmox-ultimate-updater-notify"
 printf 'failure\n' >"$STATE_PATH/health-status"
 printf 'hash\n' >"$STATE_PATH/health-hash"
 printf 'fingerprint\n' >"$STATE_PATH/upstream-fingerprint"
-printf '5.0\n' >"$STATE_PATH/upstream-version"
+printf 'safety-fingerprint\n' >"$STATE_PATH/upstream-safety-fingerprint"
+printf '5.1\n' >"$STATE_PATH/upstream-version"
 PUUN_ROOT_PREFIX="$INSTALL_FIXTURE/root" PUUN_CRONTAB="$INSTALL_FIXTURE/bin/crontab" bash "$INSTALLER" uninstall
 assert "uninstall restores original update-check cron" grep -Fq "/usr/local/sbin/update -check" "$CRON_STORE"
 assert "uninstall restores system crontab upstream checker" grep -Fq "RUN_FROM_CRON=true /usr/local/sbin/update -check" "$SYSTEM_CRON_STORE"
 assert "uninstall restores cron.d upstream checker" grep -Fq "/etc/ultimate-updater/check-updates.sh" "$CRON_D_STORE"
-assert "uninstall removes compatibility health state" test ! -e "$STATE_PATH/health-status" -a ! -e "$STATE_PATH/health-hash" -a ! -e "$STATE_PATH/upstream-fingerprint" -a ! -e "$STATE_PATH/upstream-version"
+assert "uninstall removes compatibility health state" test ! -e "$STATE_PATH/health-status" -a ! -e "$STATE_PATH/health-hash" -a ! -e "$STATE_PATH/upstream-fingerprint" -a ! -e "$STATE_PATH/upstream-safety-fingerprint" -a ! -e "$STATE_PATH/upstream-version"
 assert "uninstall preserves operator config and token directory" grep -Fq 'LOCAL_OPERATOR_VALUE="preserve-me"' "$CONFIG_PATH"
 rm -rf "$INSTALL_FIXTURE"
 unset TEST_CRON_STORE

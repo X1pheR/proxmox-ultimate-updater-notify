@@ -2,18 +2,23 @@
 set -Eeuo pipefail
 
 APP_NAME="proxmox-ultimate-updater-notify"
+SUPPORTED_UPDATER_VERSION="5.1"
 CONFIG_FILE="${PUUN_CONFIG_FILE:-/etc/proxmox-ultimate-updater-notify/config}"
 STATE_DIR="${PUUN_STATE_DIR:-/var/lib/proxmox-ultimate-updater-notify}"
 UPDATER_DIR="${PUUN_UPDATER_DIR:-/etc/ultimate-updater}"
 UPDATER_CONFIG="${PUUN_UPDATER_CONFIG:-${UPDATER_DIR}/update.conf}"
 UPDATER_LOG="${PUUN_UPDATER_LOG:-/var/log/ultimate-updater.log}"
 UPDATER_ENTRYPOINT="${PUUN_UPDATER_ENTRYPOINT:-${UPDATER_DIR}/update.sh}"
+UPDATER_CHECK_SCRIPT="${PUUN_UPDATER_CHECK_SCRIPT:-${UPDATER_DIR}/check-updates.sh}"
+UPDATER_STATUS_MODEL="${PUUN_UPDATER_STATUS_MODEL:-${UPDATER_DIR}/status-model.sh}"
+UPDATER_TARGET_RUNTIME="${PUUN_UPDATER_TARGET_RUNTIME:-${UPDATER_DIR}/target-runtime.sh}"
+UPDATER_STATUS_FILE="${PUUN_UPDATER_STATUS_FILE:-${UPDATER_DIR}/status.json}"
 SYSTEMCTL="${PUUN_SYSTEMCTL:-systemctl}"
 CRONTAB="${PUUN_CRONTAB:-crontab}"
 SYSTEM_CRONTAB="${PUUN_SYSTEM_CRONTAB:-/etc/crontab}"
 CRON_D_DIR="${PUUN_CRON_D_DIR:-/etc/cron.d}"
 TIMEOUT_BIN="${PUUN_TIMEOUT:-timeout}"
-COMMAND_TIMEOUT_SECONDS="${PUUN_COMMAND_TIMEOUT_SECONDS:-120}"
+UPSTREAM_CHECK_TIMEOUT_SECONDS="${PUUN_UPSTREAM_CHECK_TIMEOUT_SECONDS:-540}"
 MANUAL_DEDUPE_SECONDS="${PUUN_MANUAL_DEDUPE_SECONDS:-90}"
 NTFY_MESSAGE_MAX_BYTES="${PUUN_NTFY_MESSAGE_MAX_BYTES:-3500}"
 
@@ -48,8 +53,8 @@ load_config() {
   require_command curl
 }
 
-run_bounded() {
-  "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${COMMAND_TIMEOUT_SECONDS}s" "$@"
+run_upstream_check_bounded() {
+  "$TIMEOUT_BIN" --signal=TERM --kill-after=10s "${UPSTREAM_CHECK_TIMEOUT_SECONDS}s" "$@"
 }
 
 ensure_state_dir() {
@@ -211,8 +216,39 @@ read_updater_version() {
 upstream_fingerprint() {
   {
     sha256sum "$UPDATER_ENTRYPOINT" | awk '{print $1}'
+    sha256sum "$UPDATER_CHECK_SCRIPT" | awk '{print $1}'
+    sha256sum "$UPDATER_STATUS_MODEL" | awk '{print $1}'
+    sha256sum "$UPDATER_TARGET_RUNTIME" | awk '{print $1}'
     sha256sum "${UPDATER_DIR}/tag-filter.sh" | awk '{print $1}'
   } | hash_text
+}
+
+validate_upstream_check_interface() {
+  [[ -r "$UPDATER_CHECK_SCRIPT" ]] || die "Ultimate Updater check-updates.sh is not readable"
+  [[ -r "$UPDATER_STATUS_MODEL" ]] || die "Ultimate Updater status-model.sh is not readable"
+  [[ -r "$UPDATER_TARGET_RUNTIME" ]] || die "Ultimate Updater target-runtime.sh is not readable"
+
+  grep -Fq 'UU_JOB_SOURCE' "$UPDATER_CHECK_SCRIPT" || die "Ultimate Updater check interface no longer exposes initial-inventory mode"
+  grep -Fq 'initial-inventory' "$UPDATER_CHECK_SCRIPT" || die "Ultimate Updater check interface no longer exposes initial-inventory mode"
+  grep -Fq 'UU_DEFER_NOTIFICATION' "$UPDATER_CHECK_SCRIPT" || die "Ultimate Updater check interface no longer supports deferred notifications"
+  grep -Fq 'HOST_KERNEL_REBOOT_REQUIRED' "$UPDATER_CHECK_SCRIPT" || die "Ultimate Updater check interface no longer exposes Proxmox kernel reboot detection"
+  grep -Fq 'normal_updates' "$UPDATER_STATUS_MODEL" || die "Ultimate Updater status model no longer exposes normal update counts"
+  grep -Fq 'security_updates' "$UPDATER_STATUS_MODEL" || die "Ultimate Updater status model no longer exposes security update counts"
+  grep -Fq 'reboot_required' "$UPDATER_STATUS_MODEL" || die "Ultimate Updater status model no longer exposes reboot state"
+  if ! (
+    set +u
+    # These names are consumed by the dynamically sourced Ultimate Updater
+    # status model; ShellCheck cannot see those indirect references.
+    # shellcheck disable=SC2034
+    LOCAL_FILES="$UPDATER_DIR"
+    # shellcheck disable=SC2034
+    STATUS_MODEL_FILE="$UPDATER_STATUS_FILE"
+    # shellcheck disable=SC1090
+    . "$UPDATER_STATUS_MODEL"
+    declare -F STATUS_MODEL_RENDER_NOTIFICATION >/dev/null 2>&1
+  ); then
+    die "Ultimate Updater status model no longer exposes STATUS_MODEL_RENDER_NOTIFICATION"
+  fi
 }
 
 validate_companion_units() {
@@ -233,7 +269,11 @@ validate_tag_helper() (
 
   [[ -r "$UPDATER_CONFIG" ]] || die "Ultimate Updater configuration is not readable: $UPDATER_CONFIG"
   [[ -r "${UPDATER_DIR}/tag-filter.sh" ]] || die "Ultimate Updater tag-filter.sh is not readable"
+  # The sourced upstream helper resolves these variables indirectly from the
+  # variable names passed to apply_only_exclude_tags.
+  # shellcheck disable=SC2034
   ONLY=$(read_updater_value ONLY_UPDATE_CHECK || true)
+  # shellcheck disable=SC2034
   EXCLUDED=$(read_updater_value EXCLUDE_UPDATE_CHECK || true)
 
   # Upstream's helper is not guaranteed to be nounset-safe. Keep the relaxed
@@ -253,9 +293,11 @@ compatibility_probe() {
 
   [[ -r "$UPDATER_ENTRYPOINT" ]] || die "Ultimate Updater entrypoint is not readable: $UPDATER_ENTRYPOINT"
   require_command sha256sum
+  validate_upstream_check_interface || return 1
   require_command "$CRONTAB"
   version=$(read_updater_version)
   [[ -n "$version" ]] || die "Ultimate Updater version marker is missing or incompatible"
+  [[ "$version" == "$SUPPORTED_UPDATER_VERSION" ]] || die "unsupported Ultimate Updater version: $version; this notifier release requires $SUPPORTED_UPDATER_VERSION"
   configured_log=$(read_updater_value LOG_FILE || true)
   [[ -n "$configured_log" ]] || die "Ultimate Updater LOG_FILE is missing from $UPDATER_CONFIG"
   [[ "$configured_log" == "$UPDATER_LOG" ]] || die "Ultimate Updater LOG_FILE changed; expected observer path $UPDATER_LOG"
@@ -299,29 +341,33 @@ process_health_success() {
   local version=$1
   local fingerprint=$2
   local previous_status
-  local previous_fingerprint
-  local previous_version
+  local accepted_fingerprint
 
   ensure_state_dir
   previous_status=$(state_read "${STATE_DIR}/health-status")
-  previous_fingerprint=$(state_read "${STATE_DIR}/upstream-fingerprint")
-  previous_version=$(state_read "${STATE_DIR}/upstream-version")
+  accepted_fingerprint=$(state_read "${STATE_DIR}/upstream-safety-fingerprint")
+
+  # v0.4+ delegates safety-critical collection to Ultimate Updater 5.1's
+  # initial-inventory/status interface. Establish the accepted source
+  # fingerprint once for this release, then fail closed on any later source
+  # drift until a new companion release explicitly accepts that boundary.
+  if [[ -n "$accepted_fingerprint" && "$accepted_fingerprint" != "$fingerprint" ]]; then
+    process_health_failure "Ultimate Updater safety-critical interface changed after acceptance. Automatic checks are blocked until this notifier release is updated for the changed upstream source."
+    return 1
+  fi
 
   if [[ "$previous_status" == "failure" ]]; then
     if ! send_ntfy "Compatibility check recovered" "white_check_mark" "Ultimate Updater compatibility checks are succeeding again. Current version: $version"; then
       log "failed to send ntfy compatibility recovery notification"
       return 1
     fi
-  elif [[ -n "$previous_fingerprint" && "$previous_fingerprint" != "$fingerprint" ]]; then
-    if ! send_ntfy "Ultimate Updater change verified" "white_check_mark" "Compatibility checks passed after an Ultimate Updater interface change. Version: ${previous_version:-unknown} -> $version"; then
-      log "failed to send ntfy verified upstream-change notification"
-      return 1
-    fi
   fi
 
   atomic_write "${STATE_DIR}/health-status" "healthy"
   atomic_write "${STATE_DIR}/health-hash" ""
-  atomic_write "${STATE_DIR}/upstream-fingerprint" "$fingerprint"
+  if [[ -z "$accepted_fingerprint" ]]; then
+    atomic_write "${STATE_DIR}/upstream-safety-fingerprint" "$fingerprint"
+  fi
   atomic_write "${STATE_DIR}/upstream-version" "$version"
 }
 
@@ -356,364 +402,59 @@ run_health() {
   process_health_success "$version" "$fingerprint"
 }
 
-is_word_in_list() {
-  local needle=$1
-  local item
-  shift
-  for item in "$@"; do
-    [[ "$item" == "$needle" ]] && return 0
-  done
-  return 1
-}
+render_upstream_status() (
+  set +u
+  # These names are consumed by the dynamically sourced Ultimate Updater
+  # status model; ShellCheck cannot see those indirect references.
+  # shellcheck disable=SC2034
+  LOCAL_FILES="$UPDATER_DIR"
+  # shellcheck disable=SC2034
+  STATUS_MODEL_FILE="$UPDATER_STATUS_FILE"
+  # shellcheck disable=SC1090
+  . "$UPDATER_STATUS_MODEL"
+  declare -F STATUS_MODEL_RENDER_NOTIFICATION >/dev/null 2>&1 || return 1
+  STATUS_MODEL_RENDER_NOTIFICATION "$UPDATER_STATUS_FILE" check
+)
 
-resolve_update_selection() {
-  ONLY_UPDATE_CHECK=$(read_updater_value ONLY_UPDATE_CHECK || true)
-  EXCLUDE_UPDATE_CHECK=$(read_updater_value EXCLUDE_UPDATE_CHECK || true)
+collect_upstream_updates() {
+  local output_file
+  local error_file
+  local rc
 
-  if [[ -r "${UPDATER_DIR}/tag-filter.sh" ]]; then
-    local ONLY=$ONLY_UPDATE_CHECK
-    local EXCLUDED=$EXCLUDE_UPDATE_CHECK
-    local restore_nounset=no
-
-    # Upstream's selection helper is not guaranteed to be safe under `set -u`.
-    # Isolate only this borrowed helper from nounset, then restore our stricter
-    # shell contract before continuing with companion-owned logic.
-    [[ $- == *u* ]] && restore_nounset=yes
-    set +u
-    # This is an upstream selection helper only. The updater's check implementation
-    # itself is deliberately not executed because some non-APT code paths upgrade packages.
-    # shellcheck disable=SC1091
-    . "${UPDATER_DIR}/tag-filter.sh"
-    if declare -F apply_only_exclude_tags >/dev/null 2>&1; then
-      apply_only_exclude_tags ONLY EXCLUDED
-      ONLY_UPDATE_CHECK=$ONLY
-      EXCLUDE_UPDATE_CHECK=$EXCLUDED
-    fi
-    [[ "$restore_nounset" == yes ]] && set -u
-  fi
-}
-
-id_is_selected() {
-  local id=$1
-  local -a only_ids=()
-  local -a excluded_ids=()
-
-  # shellcheck disable=SC2206
-  only_ids=( $ONLY_UPDATE_CHECK )
-  # shellcheck disable=SC2206
-  excluded_ids=( $EXCLUDE_UPDATE_CHECK )
-
-  if ((${#only_ids[@]} > 0)); then
-    is_word_in_list "$id" "${only_ids[@]}"
-    return
-  fi
-  ! is_word_in_list "$id" "${excluded_ids[@]}"
-}
-
-extract_apt_packages() {
-  sed -n '/^Inst /p'
-}
-
-append_apt_result() {
-  local type=$1
-  local id=$2
-  local name=$3
-  local reboot=$4
-  local apt_output=$5
-  local packages
-  local count
-  local security_count
-
-  packages=$(printf '%s\n' "$apt_output" | extract_apt_packages)
-  count=$(printf '%s\n' "$packages" | sed '/^$/d' | wc -l | tr -d ' ')
-  security_count=$(printf '%s\n' "$packages" | grep -ciE '(security|updates-security)' || true)
-
-  if [[ "$count" -gt 0 || "$reboot" == "yes" ]]; then
-    printf 'target|%s|%s|%s|packages=%s|security=%s|reboot=%s\n' \
-      "$type" "$id" "$name" "$count" "$security_count" "$reboot"
-    if [[ -n "$packages" ]]; then
-      printf '%s\n' "$packages" | sed 's/^/package|/'
-    fi
-  fi
-}
-
-check_host() {
-  local name
-  local apt_output
-  local reboot=no
-
-  require_command apt-get
-  name=$(hostname -s)
-  run_bounded env DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null
-  apt_output=$(run_bounded env LC_ALL=C apt-get -s upgrade)
-  [[ -f /var/run/reboot-required.pkgs ]] && reboot=yes
-  append_apt_result host host "$name" "$reboot" "$apt_output"
-}
-
-check_lxc() {
-  local id=$1
-  local status
-  local ostype
-  local name
-  local apt_output
-  local reboot=no
-
-  status=$(pct status "$id" | awk '{print $2}')
-  if [[ "$status" != "running" ]]; then
-    die "LXC $id is $status; automatic checks never start or stop guests"
-  fi
-
-  ostype=$(pct config "$id" | awk '/^ostype:/ {print $2; exit}')
-  case "$ostype" in
-    debian|ubuntu|devuan) ;;
-    *) die "LXC $id uses unsupported automatic-check OS family: ${ostype:-unknown}" ;;
-  esac
-
-  name=$(run_bounded pct exec "$id" -- hostname 2>/dev/null || printf 'lxc-%s' "$id")
-  apt_output=$(run_bounded pct exec "$id" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
-  if run_bounded pct exec "$id" -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
-    reboot=yes
-  fi
-  append_apt_result lxc "$id" "$name" "$reboot" "$apt_output"
-}
-
-ssh_vm_value() {
-  local file=$1
-  local key=$2
-  awk -F'"' -v key="$key" '$0 ~ "^" key "=" { print $2; exit }' "$file"
-}
-
-check_vm_ssh() {
-  local id=$1
-  local file="${UPDATER_DIR}/VMs/${id}"
-  local ip
-  local user
-  local port
-  local name
-  local apt_output
-  local reboot=no
-  local refresh_cmd
-
-  ip=$(ssh_vm_value "$file" IP)
-  user=$(ssh_vm_value "$file" USER)
-  port=$(ssh_vm_value "$file" SSH_VM_PORT)
-  user=${user:-root}
-  port=${port:-22}
-  [[ -n "$ip" ]] || die "VM $id SSH configuration has no IP"
-
-  if ! run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" true >/dev/null 2>&1; then
-    die "VM $id SSH connection failed"
-  fi
-  if ! run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'command -v apt-get >/dev/null 2>&1'; then
-    die "VM $id uses an unsupported automatic-check package manager"
-  fi
-
-  if [[ "$user" == "root" ]]; then
-    refresh_cmd='DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null'
-  else
-    refresh_cmd='sudo -n /usr/bin/apt-get update -y >/dev/null'
-  fi
-
-  if ! run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" "$refresh_cmd"; then
-    if [[ "$user" == "root" ]]; then
-      die "VM $id package metadata refresh failed"
-    fi
-    die "VM $id package metadata refresh failed: non-root SSH user requires passwordless sudo for /usr/bin/apt-get update -y"
-  fi
-
-  apt_output=$(run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=30 -p "$port" "$user@$ip" 'LC_ALL=C apt-get -s upgrade')
-  if run_bounded ssh -q -o BatchMode=yes -o ConnectTimeout=5 -p "$port" "$user@$ip" 'test -f /var/run/reboot-required.pkgs'; then
-    reboot=yes
-  fi
-  name=$(qm config "$id" | awk '/^name:/ {print $2; exit}')
-  name=${name:-vm-$id}
-  append_apt_result vm "$id" "$name" "$reboot" "$apt_output"
-}
-
-qemu_guest_stdout() {
-  python3 -c 'import json,sys; print(json.load(sys.stdin).get("out-data", ""), end="")'
-}
-
-check_vm_qemu() {
-  local id=$1
-  local status
-  local name
-  local probe
-  local result
-  local apt_output
-  local reboot=no
-
-  status=$(qm status "$id" | awk '{print $2}')
-  if [[ "$status" != "running" ]]; then
-    die "VM $id is $status; automatic checks never start, resume, stop, suspend, or reboot guests"
-  fi
-
-  probe=$(run_bounded qm guest exec "$id" --timeout "$COMMAND_TIMEOUT_SECONDS" -- sh -c 'command -v apt-get >/dev/null 2>&1 && printf apt' 2>/dev/null | qemu_guest_stdout || true)
-  [[ "$probe" == "apt" ]] || die "VM $id uses an unsupported automatic-check package manager or QEMU guest agent is unavailable"
-
-  result=$(run_bounded qm guest exec "$id" --timeout "$COMMAND_TIMEOUT_SECONDS" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null && LC_ALL=C apt-get -s upgrade')
-  apt_output=$(printf '%s' "$result" | qemu_guest_stdout)
-  if run_bounded qm guest exec "$id" --timeout "$COMMAND_TIMEOUT_SECONDS" -- test -f /var/run/reboot-required.pkgs >/dev/null 2>&1; then
-    reboot=yes
-  fi
-  name=$(qm config "$id" | awk '/^name:/ {print $2; exit}')
-  name=${name:-vm-$id}
-  append_apt_result vm "$id" "$name" "$reboot" "$apt_output"
-}
-
-check_vm() {
-  local id=$1
-  if [[ -f "${UPDATER_DIR}/VMs/${id}" ]]; then
-    check_vm_ssh "$id"
-  else
-    check_vm_qemu "$id"
-  fi
-}
-
-collect_updates() {
-  local with_host
-  local with_lxc
-  local with_vm
-  local check_running_lxc
-  local check_stopped_lxc
-  local check_running_vm
-  local check_stopped_vm
-  local check_paused_vm
-  local id
-  local status
-
-  [[ -r "$UPDATER_CONFIG" ]] || die "Ultimate Updater configuration is not readable: $UPDATER_CONFIG"
-  require_command sha256sum
-  require_command "$TIMEOUT_BIN"
-  require_command pct
-  require_command qm
   require_command python3
-  resolve_update_selection
+  require_command "$TIMEOUT_BIN"
+  ensure_state_dir
+  output_file=$(mktemp "${STATE_DIR}/.upstream-check.stdout.XXXXXX")
+  error_file=$(mktemp "${STATE_DIR}/.upstream-check.stderr.XXXXXX")
 
-  with_host=$(read_updater_value CHECK_WITH_HOST || true)
-  with_lxc=$(read_updater_value CHECK_WITH_LXC || true)
-  with_vm=$(read_updater_value CHECK_WITH_VM || true)
-  check_running_lxc=$(read_updater_value CHECK_RUNNING_CONTAINER || true)
-  check_stopped_lxc=$(read_updater_value CHECK_STOPPED_CONTAINER || true)
-  check_running_vm=$(read_updater_value CHECK_RUNNING_VM || true)
-  check_stopped_vm=$(read_updater_value CHECK_STOPPED_VM || true)
-  check_paused_vm=$(read_updater_value CHECK_PAUSED_VM || true)
+  set +e
+  run_upstream_check_bounded env \
+    UU_JOB_SOURCE=initial-inventory \
+    UU_DEFER_NOTIFICATION=true \
+    TAG_OUTPUT=false \
+    STATUS_MODEL_FILE="$UPDATER_STATUS_FILE" \
+    "$UPDATER_CHECK_SCRIPT" >"$output_file" 2>"$error_file"
+  rc=$?
+  set -e
 
-  if [[ "$with_host" == "true" ]]; then
-    check_host
+  if [[ "$rc" -ne 0 ]]; then
+    if [[ -s "$error_file" ]]; then
+      cat "$error_file" >&2
+    elif [[ -s "$output_file" ]]; then
+      cat "$output_file" >&2
+    else
+      printf 'Ultimate Updater initial-inventory check failed with exit code %s\n' "$rc" >&2
+    fi
+    rm -f "$output_file" "$error_file"
+    return "$rc"
   fi
-
-  if [[ "$with_lxc" == "true" ]]; then
-    while read -r id _; do
-      [[ -n "$id" ]] || continue
-      id_is_selected "$id" || continue
-      status=$(pct status "$id" | awk '{print $2}')
-      if [[ "$status" == "running" && "$check_running_lxc" == "true" ]]; then
-        check_lxc "$id"
-      elif [[ "$status" != "running" && "$check_stopped_lxc" == "true" ]]; then
-        die "LXC $id is $status but is configured for update checks; automatic checks never start or stop guests"
-      fi
-    done < <(pct list | awk 'NR > 1 {print $1, $2}')
-  fi
-
-  if [[ "$with_vm" == "true" ]]; then
-    while read -r id _; do
-      [[ -n "$id" ]] || continue
-      id_is_selected "$id" || continue
-      status=$(qm status "$id" | awk '{print $2}')
-      if [[ "$status" == "running" && "$check_running_vm" == "true" ]]; then
-        check_vm "$id"
-      elif [[ "$status" == "paused" && "$check_paused_vm" == "true" ]]; then
-        die "VM $id is paused but is configured for update checks; automatic checks never resume or suspend guests"
-      elif [[ "$status" != "running" && "$status" != "paused" && "$check_stopped_vm" == "true" ]]; then
-        die "VM $id is $status but is configured for update checks; automatic checks never start or stop guests"
-      fi
-    done < <(qm list | awk 'NR > 1 {print $1, $3}')
-  fi
-}
-
-format_update_message() {
-  local normalized=$1
-  local target_count
-  local package_count
-  local security_count
-  local reboot_count
-  local target_word
-  local update_word
-  local reboot_summary
-  local line
-  local type
-  local id
-  local name
-  local reboot_field
-  local raw_package
-  local package_name
-  local new_version
-  local security_marker
-
-  target_count=$(printf '%s\n' "$normalized" | grep -c '^target|' || true)
-  package_count=$(printf '%s\n' "$normalized" | grep -c '^package|' || true)
-  security_count=$(printf '%s\n' "$normalized" | awk -F'|' '
-    $1 == "target" {
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^security=/) {
-          sub(/^security=/, "", $i)
-          total += $i
-        }
-      }
-    }
-    END { print total + 0 }
-  ')
-  reboot_count=$(printf '%s\n' "$normalized" | grep -c '^target|.*|reboot=yes$' || true)
-
-  [[ "$target_count" -eq 1 ]] && target_word=target || target_word=targets
-  [[ "$package_count" -eq 1 ]] && update_word=update || update_word=updates
-  if [[ "$reboot_count" -eq 0 ]]; then
-    reboot_summary="no reboot"
-  elif [[ "$reboot_count" -eq 1 ]]; then
-    reboot_summary="1 reboot required"
-  else
-    reboot_summary="$reboot_count reboots required"
-  fi
-
-  printf '**%s %s · %s %s · %s security · %s**\n' \
-    "$target_count" "$target_word" "$package_count" "$update_word" "$security_count" "$reboot_summary"
-
-  while IFS= read -r line; do
-    case "$line" in
-      target\|*)
-        IFS='|' read -r _ type id name _ _ reboot_field <<<"$line"
-        case "$type" in
-          host) printf '\n### Host · %s\n' "$name" ;;
-          lxc) printf '\n### LXC %s · %s\n' "$id" "$name" ;;
-          vm) printf '\n### VM %s · %s\n' "$id" "$name" ;;
-          *) printf '\n### %s %s · %s\n' "$type" "$id" "$name" ;;
-        esac
-        if [[ "$reboot_field" == "reboot=yes" ]]; then
-          printf '%s\n' '- **Reboot required**'
-        fi
-        ;;
-      package\|*)
-        raw_package=${line#package|}
-        package_name=${raw_package#Inst }
-        package_name=${package_name%% *}
-        new_version=$(printf '%s\n' "$raw_package" | sed -nE 's/^Inst [^ ]+( \[[^]]+\])? \(([^ )]+).*/\2/p')
-        security_marker=""
-        if printf '%s\n' "$raw_package" | grep -qiE '(security|updates-security)'; then
-          security_marker="🔐 "
-        fi
-        if [[ -n "$new_version" ]]; then
-          printf -- "- %s\`%s\` → \`%s\`\n" "$security_marker" "$package_name" "$new_version"
-        else
-          printf -- "- %s\`%s\` — update available\n" "$security_marker" "$package_name"
-        fi
-        ;;
-    esac
-  done < <(printf '%s\n' "$normalized" | sed -n '1,40p')
+  rm -f "$output_file" "$error_file"
+  [[ -s "$UPDATER_STATUS_FILE" ]] || die "Ultimate Updater did not produce status output: $UPDATER_STATUS_FILE"
+  render_upstream_status
 }
 
 process_check_success() {
-  local normalized=$1
+  local message=$1
   local previous_status
   local previous_hash
   local current_hash
@@ -722,8 +463,8 @@ process_check_success() {
   previous_status=$(state_read "${STATE_DIR}/check-status")
   previous_hash=$(state_read "${STATE_DIR}/check-hash")
 
-  if [[ -n "$normalized" ]]; then
-    current_hash=$(printf '%s\n' "$normalized" | hash_text)
+  if [[ -n "$message" ]]; then
+    current_hash=$(printf '%s\n' "$message" | hash_text)
     if [[ "$previous_status" == "failure" ]]; then
       if ! send_ntfy "Update check recovered" "white_check_mark" "Automatic update checks are succeeding again."; then
         log "failed to send ntfy recovery notification"
@@ -731,12 +472,12 @@ process_check_success() {
       fi
     fi
     if [[ "$previous_status" != "updates" ]]; then
-      if ! send_ntfy "Updates available" "package" "$(format_update_message "$normalized")" true; then
+      if ! send_ntfy "Updates available" "package" "$message"; then
         log "failed to send ntfy updates-available notification"
         return 1
       fi
     elif [[ "$previous_hash" != "$current_hash" ]]; then
-      if ! send_ntfy "Available updates changed" "package" "$(format_update_message "$normalized")" true; then
+      if ! send_ntfy "Available updates changed" "package" "$message"; then
         log "failed to send ntfy changed-updates notification"
         return 1
       fi
@@ -797,7 +538,7 @@ run_check() {
   error_file=$(mktemp)
 
   set +e
-  ( collect_updates ) >"$output_file" 2>"$error_file"
+  ( collect_upstream_updates ) >"$output_file" 2>"$error_file"
   rc=$?
   set -e
 
@@ -812,9 +553,38 @@ run_check() {
 
   normalized=$(cat "$output_file")
   rm -f "$output_file" "$error_file"
-  if ! process_check_success "$normalized"; then
-    return 1
+  local upstream_state upstream_body
+  upstream_state=${normalized%%$'\n'*}
+  upstream_state=${upstream_state#STATE=}
+  if [[ "$normalized" == *$'\n'* ]]; then
+    upstream_body=${normalized#*$'\n'}
+  else
+    upstream_body=""
   fi
+  case "$upstream_state" in
+    updates)
+      if ! process_check_success "$upstream_body"; then
+        return 1
+      fi
+      ;;
+    current|empty)
+      if ! process_check_success ""; then
+        return 1
+      fi
+      ;;
+    issues)
+      if ! process_check_failure "$upstream_body"; then
+        return 1
+      fi
+      return 1
+      ;;
+    *)
+      if ! process_check_failure "Ultimate Updater returned an unsupported notification state: ${upstream_state:-missing}"; then
+        return 1
+      fi
+      return 1
+      ;;
+  esac
   local heartbeat_error
   if ! heartbeat_error=$(send_gatus_heartbeat 2>&1); then
     if ! process_check_failure "Gatus heartbeat delivery failed${heartbeat_error:+: $heartbeat_error}"; then
@@ -931,7 +701,7 @@ usage() {
   cat <<'EOF'
 Usage: proxmox-ultimate-updater-notify <check|health|observe-manual>
 
-  check           Refresh APT metadata and report available updates without installing packages.
+  check           Run the accepted Ultimate Updater read-only inventory/status check and notify on state changes.
   health          Validate Ultimate Updater compatibility and companion scheduling health.
   observe-manual  Inspect the Ultimate Updater log and notify on completed operator-triggered runs.
 EOF

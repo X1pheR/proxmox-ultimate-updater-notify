@@ -270,6 +270,7 @@ uninstall_product() {
     "$STATE_DIR/health-status" \
     "$STATE_DIR/health-hash" \
     "$STATE_DIR/upstream-fingerprint" \
+    "$STATE_DIR/upstream-safety-fingerprint" \
     "$STATE_DIR/upstream-version" \
     "$STATE_DIR/manual-signature" \
     "$STATE_DIR/manual-time"
