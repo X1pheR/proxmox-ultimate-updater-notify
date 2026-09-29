@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 APP_NAME="proxmox-ultimate-updater-notify"
-SUPPORTED_UPDATER_VERSION="5.1"
+SUPPORTED_UPDATER_VERSION="5.1.2"
+SUPPORTED_STATUS_SCHEMA_VERSION="1"
 CONFIG_FILE="${PUUN_CONFIG_FILE:-/etc/proxmox-ultimate-updater-notify/config}"
 STATE_DIR="${PUUN_STATE_DIR:-/var/lib/proxmox-ultimate-updater-notify}"
 UPDATER_DIR="${PUUN_UPDATER_DIR:-/etc/ultimate-updater}"
@@ -402,6 +403,32 @@ run_health() {
   process_health_success "$version" "$fingerprint"
 }
 
+validate_upstream_status_schema() {
+  require_command python3
+  python3 - "$UPDATER_STATUS_FILE" "$SUPPORTED_STATUS_SCHEMA_VERSION" <<'PYJSON'
+import json
+import sys
+
+path = sys.argv[1]
+expected = int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"Ultimate Updater status schema validation failed: {exc}")
+
+if not isinstance(payload, dict):
+    raise SystemExit("Ultimate Updater status schema validation failed: root must be an object")
+actual = payload.get("schema_version")
+if type(actual) is not int or actual != expected:
+    raise SystemExit(
+        f"Ultimate Updater status schema_version mismatch: expected {expected}, observed {actual!r}"
+    )
+if not isinstance(payload.get("targets"), list):
+    raise SystemExit("Ultimate Updater status schema validation failed: targets must be a list")
+PYJSON
+}
+
 render_upstream_status() (
   set +u
   # These names are consumed by the dynamically sourced Ultimate Updater
@@ -450,6 +477,7 @@ collect_upstream_updates() {
   fi
   rm -f "$output_file" "$error_file"
   [[ -s "$UPDATER_STATUS_FILE" ]] || die "Ultimate Updater did not produce status output: $UPDATER_STATUS_FILE"
+  validate_upstream_status_schema || return 1
   render_upstream_status
 }
 

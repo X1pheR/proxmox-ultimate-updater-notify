@@ -4,6 +4,12 @@ This file records user-visible changes to Proxmox Ultimate Updater Notify.
 
 ## Unreleased
 
+## 0.4.1 - 2026-09-20
+
+- Explicitly accepts Ultimate Updater 5.1.2 after review of its delegated read-only initial-inventory/status interfaces.
+- Scheduled checks now require structured status schema_version 1 and fail closed before rendering or success heartbeat when the schema changes.
+- Keeps the safety-critical upstream source fingerprint guard intact; deployment owners must explicitly accept the reviewed 5.1.2 fingerprint rather than clearing compatibility state blindly.
+
 ## 0.4.0 - 2026-09-11
 
 - Automatic checks now delegate collection to Ultimate Updater 5.1's read-only `initial-inventory` status interface instead of maintaining a parallel APT/SSH/QGA collector.

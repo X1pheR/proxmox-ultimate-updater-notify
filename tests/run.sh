@@ -50,7 +50,7 @@ apply_only_exclude_tags() { return 0; }
 EOF
   cat >"$FIXTURE/updater/update.sh" <<'EOF'
 #!/usr/bin/env bash
-VERSION="5.1"
+VERSION="5.1.2"
 EOF
   cat >"$FIXTURE/updater/status-model.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -436,11 +436,11 @@ assert "inactive manual path watcher fails compatibility health" test "$health_p
 assert "inactive manual path watcher is reported through ntfy" grep -Fq "manual.path" "$FIXTURE/curl-args"
 cleanup_fixture
 
-# Compatibility health: the accepted 5.1 safety boundary is baselined once and then immutable.
+# Compatibility health: the accepted 5.1.2 safety boundary is baselined once and then immutable.
 new_fixture
 bash "$APP" health
-assert "initial healthy 5.1 compatibility baseline is silent" test "$(count_curl)" -eq 0
-assert "initial healthy 5.1 compatibility baseline stores safety fingerprint" test -s "$FIXTURE/state/upstream-safety-fingerprint"
+assert "initial healthy 5.1.2 compatibility baseline is silent" test "$(count_curl)" -eq 0
+assert "initial healthy 5.1.2 compatibility baseline stores safety fingerprint" test -s "$FIXTURE/state/upstream-safety-fingerprint"
 accepted_fingerprint=$(cat "$FIXTURE/state/upstream-safety-fingerprint" 2>/dev/null || printf missing)
 printf '\n# simulated upstream source drift\n' >>"$FIXTURE/updater/check-updates.sh"
 set +e
@@ -732,6 +732,27 @@ bash "$APP" check
 assert "reboot-required target keeps its update split" grep -Fq 'S: 0 / N: 1' "$FIXTURE/curl-args"
 assert "reboot-required section is forwarded from Ultimate Updater" grep -Fq 'Reboot required:' "$FIXTURE/curl-args"
 assert "reboot-required target identity is forwarded" grep -Fq 'docker' "$FIXTURE/curl-args"
+cleanup_fixture
+
+# Structured status schema drift must fail closed before rendering or heartbeat success.
+new_fixture
+python3 - "$FIXTURE/upstream-status.json" <<'PYJSON'
+import json
+import sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+payload["schema_version"] = 2
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2)
+PYJSON
+set +e
+bash "$APP" check >/dev/null 2>&1
+schema_drift_rc=$?
+set -e
+assert "status schema drift keeps scheduled check non-zero" test "$schema_drift_rc" -ne 0
+assert "status schema drift persists failed check state" grep -Fqx 'failure' "$FIXTURE/state/check-status"
+assert "status schema drift is reported through ntfy" grep -Fq 'schema_version mismatch' "$FIXTURE/curl-args"
 cleanup_fixture
 
 # Ultimate Updater targets that were selected but not checked remain visible as check issues.

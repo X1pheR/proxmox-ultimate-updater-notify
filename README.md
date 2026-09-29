@@ -13,7 +13,7 @@ This project is not affiliated with, endorsed by, or maintained by the Ultimate 
 
 ## What it adds
 
-- Scheduled update checks at 07:00 and 19:00 through systemd, delegated to Ultimate Updater 5.1's read-only `initial-inventory` status interface.
+- Scheduled update checks at 07:00 and 19:00 through systemd, delegated to Ultimate Updater 5.1.2's read-only `initial-inventory` status interface.
 - ntfy notifications when updates appear, change, clear, fail, or recover.
 - ntfy update messages that forward Ultimate Updater's native status rendering, including security/normal splits, totals, and reboot-required targets.
 - Notifications for completed operator-triggered Ultimate Updater runs.
@@ -32,7 +32,7 @@ This project is not affiliated with, endorsed by, or maintained by the Ultimate 
 
 Automatic checks:
 
-- invoke Ultimate Updater 5.1's `check-updates.sh` only with `UU_JOB_SOURCE=initial-inventory` and deferred upstream notifications;
+- invoke Ultimate Updater 5.1.2's `check-updates.sh` only with `UU_JOB_SOURCE=initial-inventory` and deferred upstream notifications;
 - consume Ultimate Updater's structured `status.json` and native `STATUS_MODEL_RENDER_NOTIFICATION` output instead of reimplementing package counts or reboot detection;
 - never invoke the normal upstream `update -check` path;
 - never install package updates;
@@ -43,12 +43,12 @@ See [Safety and compatibility](docs/safety-and-compatibility.md) for the complet
 
 ## Requirements
 
-- Proxmox VE with Ultimate Updater **5.1** installed under `/etc/ultimate-updater`;
+- Proxmox VE with Ultimate Updater **5.1.2** installed under `/etc/ultimate-updater`;
 - Bash, `curl`, GNU `timeout`, `sha256sum`, and `python3`;
 - an ntfy topic and access token;
 - any guest-access prerequisites already required by Ultimate Updater for the targets it checks.
 
-The current safety-critical compatibility baseline is exact Ultimate Updater 5.1. See [Safety and compatibility](docs/safety-and-compatibility.md) for details.
+The current safety-critical compatibility baseline is exact Ultimate Updater 5.1.2. See [Safety and compatibility](docs/safety-and-compatibility.md) for details.
 
 ## Quick start
 
